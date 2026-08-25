@@ -34,7 +34,6 @@ function mulberry32(seed) {
 const rand = mulberry32(20260811);
 const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 const weightedPick = (options) => {
-  if (!options || options.length === 0) return null;
   const total = options.reduce((s, o) => s + o[1], 0);
   let r = rand() * total;
   for (const [val, w] of options) {
@@ -149,10 +148,21 @@ function buildLog() {
    ANALYSIS HELPERS
 --------------------------------------------------------------- */
 
+const avg = (arr) => (arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : undefined);
+
+function fmtDur(hours) {
+  if (hours === undefined || hours === null || Number.isNaN(hours)) return "–";
+  if (hours < 1) return `${Math.round(hours * 60)}m`;
+  if (hours < 48) return `${hours.toFixed(1)}h`;
+  return `${(hours / 24).toFixed(1)}d`;
+}
+
 function analyze(cases) {
   const events = cases.flatMap((c) => c.events);
   const nodeFreq = {};
   const edgeFreq = {};
+  const nodeDurSamples = {};
+  const edgeDurSamples = {};
   const durations = [];
   const endActivity = { "Close Order": 0, "Reject Order": 0, "Cancel Order": 0, other: 0 };
 
@@ -162,6 +172,9 @@ function analyze(cases) {
     for (let i = 0; i < acts.length - 1; i++) {
       const key = acts[i] + "→" + acts[i + 1];
       edgeFreq[key] = (edgeFreq[key] || 0) + 1;
+      const deltaH = (c.events[i + 1].timestamp.getTime() - c.events[i].timestamp.getTime()) / (3600 * 1000);
+      (edgeDurSamples[key] = edgeDurSamples[key] || []).push(deltaH);
+      (nodeDurSamples[acts[i]] = nodeDurSamples[acts[i]] || []).push(deltaH);
     }
     const first = c.events[0].timestamp.getTime();
     const last = c.events[c.events.length - 1].timestamp.getTime();
@@ -171,13 +184,56 @@ function analyze(cases) {
     else endActivity.other++;
   });
 
+  const nodeAvgDur = {};
+  Object.entries(nodeDurSamples).forEach(([k, v]) => (nodeAvgDur[k] = avg(v)));
+  const edgeAvgDur = {};
+  Object.entries(edgeDurSamples).forEach(([k, v]) => (edgeAvgDur[k] = avg(v)));
+
   const variantMap = {};
   cases.forEach((c) => {
-    const key = c.events.map((e) => e.activity).join(" → ");
-    if (!variantMap[key]) variantMap[key] = { key, count: 0, steps: c.events.map((e) => e.activity) };
-    variantMap[key].count++;
+    const acts = c.events.map((e) => e.activity);
+    const key = acts.join(" → ");
+    if (!variantMap[key]) {
+      variantMap[key] = { key, count: 0, steps: acts, edgeDurSamples: {}, nodeDurSamples: {} };
+    }
+    const v = variantMap[key];
+    v.count++;
+    for (let i = 0; i < acts.length - 1; i++) {
+      const ek = acts[i] + "→" + acts[i + 1];
+      const deltaH = (c.events[i + 1].timestamp.getTime() - c.events[i].timestamp.getTime()) / (3600 * 1000);
+      (v.edgeDurSamples[ek] = v.edgeDurSamples[ek] || []).push(deltaH);
+      (v.nodeDurSamples[acts[i]] = v.nodeDurSamples[acts[i]] || []).push(deltaH);
+    }
   });
-  const variants = Object.values(variantMap).sort((a, b) => b.count - a.count);
+
+  const variants = Object.values(variantMap)
+    .map((v) => {
+      const edgeFreqInStep = {};
+      const nodeFreqInStep = {};
+      v.steps.forEach((s) => (nodeFreqInStep[s] = (nodeFreqInStep[s] || 0) + 1));
+      for (let i = 0; i < v.steps.length - 1; i++) {
+        const ek = v.steps[i] + "→" + v.steps[i + 1];
+        edgeFreqInStep[ek] = (edgeFreqInStep[ek] || 0) + 1;
+      }
+      const vNodeFreq = {};
+      Object.entries(nodeFreqInStep).forEach(([k, c]) => (vNodeFreq[k] = c * v.count));
+      const vEdgeFreq = {};
+      Object.entries(edgeFreqInStep).forEach(([k, c]) => (vEdgeFreq[k] = c * v.count));
+      const vNodeAvgDur = {};
+      Object.entries(v.nodeDurSamples).forEach(([k, arr]) => (vNodeAvgDur[k] = avg(arr)));
+      const vEdgeAvgDur = {};
+      Object.entries(v.edgeDurSamples).forEach(([k, arr]) => (vEdgeAvgDur[k] = avg(arr)));
+      return {
+        key: v.key,
+        count: v.count,
+        steps: v.steps,
+        nodeFreq: vNodeFreq,
+        edgeFreq: vEdgeFreq,
+        nodeAvgDur: vNodeAvgDur,
+        edgeAvgDur: vEdgeAvgDur,
+      };
+    })
+    .sort((a, b) => b.count - a.count);
 
   const avgDuration = durations.reduce((s, d) => s + d, 0) / durations.length;
   const avgEvents = events.length / cases.length;
@@ -186,6 +242,8 @@ function analyze(cases) {
     events,
     nodeFreq,
     edgeFreq,
+    nodeAvgDur,
+    edgeAvgDur,
     variants,
     avgDuration,
     avgEvents,
@@ -219,6 +277,16 @@ const ROW_GAP = 118;
 const CANVAS_H = MAX_PER_LEVEL * ROW_GAP + 160;
 const CANVAS_W = (MAX_LEVEL + 1) * COL_GAP + 80;
 
+function computeViewBox(visibleNodes) {
+  if (!visibleNodes) return { x: 0, y: 0, w: CANVAS_W, h: CANVAS_H };
+  const levels = [...visibleNodes].map((n) => META[n].level);
+  const minL = Math.min(...levels);
+  const maxL = Math.max(...levels);
+  const x = 70 + minL * COL_GAP - 60;
+  const w = (maxL - minL) * COL_GAP + NODE_W + 130;
+  return { x, y: 0, w, h: CANVAS_H };
+}
+
 function nodePos(name) {
   const m = META[name];
   const group = LEVEL_GROUPS[m.level];
@@ -231,14 +299,36 @@ function nodePos(name) {
 }
 
 const TYPE_COLOR = {
-  start: { fill: "#123832", stroke: "#2dd4bf", text: "#5eead4" },
-  normal: { fill: "#131d2e", stroke: "#39527a", text: "#c9d6ea" },
-  exception: { fill: "#2e2410", stroke: "#d9a13a", text: "#f5c977" },
-  "end-bad": { fill: "#301620", stroke: "#e0607c", text: "#f6a3b6" },
-  "end-good": { fill: "#0f2b1c", stroke: "#34d399", text: "#7bf0bb" },
+  start: { fill: "var(--type-start-fill)", stroke: "var(--type-start-stroke)", text: "var(--type-start-text)" },
+  normal: { fill: "var(--type-normal-fill)", stroke: "var(--type-normal-stroke)", text: "var(--type-normal-text)" },
+  exception: { fill: "var(--type-exception-fill)", stroke: "var(--type-exception-stroke)", text: "var(--type-exception-text)" },
+  "end-bad": { fill: "var(--type-endbad-fill)", stroke: "var(--type-endbad-stroke)", text: "var(--type-endbad-text)" },
+  "end-good": { fill: "var(--type-endgood-fill)", stroke: "var(--type-endgood-stroke)", text: "var(--type-endgood-text)" },
 };
 
-function edgePathAndLabel(a, b, weight, maxWeight) {
+function safeId(key) {
+  return "edge-" + key.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+function metricColor(ratio) {
+  // teal (fast) → amber → red (slow/bottleneck)
+  const stops = [
+    [45, 212, 191],
+    [232, 162, 58],
+    [224, 96, 124],
+  ];
+  const t = Math.max(0, Math.min(1, ratio)) * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(t));
+  const f = t - i;
+  const c1 = stops[i];
+  const c2 = stops[i + 1];
+  const r = Math.round(c1[0] + (c2[0] - c1[0]) * f);
+  const g = Math.round(c1[1] + (c2[1] - c1[1]) * f);
+  const bl = Math.round(c1[2] + (c2[2] - c1[2]) * f);
+  return `rgb(${r}, ${g}, ${bl})`;
+}
+
+function edgePathAndLabel(a, b, value, maxValue) {
   const p1 = nodePos(a);
   const p2 = nodePos(b);
   const isSelf = a === b;
@@ -247,17 +337,18 @@ function edgePathAndLabel(a, b, weight, maxWeight) {
   const y1 = p1.y;
   const x2 = p2.x;
   const y2 = p2.y;
-  const strokeW = 1.4 + (weight / maxWeight) * 6.5;
+  const ratio = maxValue > 0 ? value / maxValue : 0;
+  const strokeW = 1.4 + ratio * 6.5;
 
   if (isSelf) {
     const d = `M ${p1.x + NODE_W * 0.28} ${p1.y - NODE_H / 2}
       C ${p1.x + NODE_W * 0.1} ${p1.y - NODE_H - 34}, ${p1.x + NODE_W * 0.9} ${p1.y - NODE_H - 34}, ${p1.x + NODE_W * 0.72} ${p1.y - NODE_H / 2}`;
-    return { d, strokeW, labelX: p1.x + NODE_W / 2, labelY: p1.y - NODE_H - 30 };
+    return { d, strokeW, ratio, labelX: p1.x + NODE_W / 2, labelY: p1.y - NODE_H - 30 };
   }
   if (forward) {
     const midX = (x1 + x2) / 2;
     const d = `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
-    return { d, strokeW, labelX: midX, labelY: (y1 + y2) / 2 };
+    return { d, strokeW, ratio, labelX: midX, labelY: (y1 + y2) / 2 };
   }
   // backward / same-level loop edge — arc below
   const bulge = 90 + Math.abs(META[a].level - META[b].level) * 4;
@@ -267,7 +358,7 @@ function edgePathAndLabel(a, b, weight, maxWeight) {
   const ty = p2.y + NODE_H / 2;
   const midX = (sx + tx) / 2;
   const d = `M ${sx} ${sy} C ${sx} ${sy + bulge}, ${tx} ${ty + bulge}, ${tx} ${ty}`;
-  return { d, strokeW, labelX: midX, labelY: Math.max(sy, ty) + bulge * 0.72 };
+  return { d, strokeW, ratio, labelX: midX, labelY: Math.max(sy, ty) + bulge * 0.72 };
 }
 
 /* ---------------------------------------------------------------
@@ -286,69 +377,144 @@ function KpiCard({ label, value, sub, accent }) {
   );
 }
 
-function ProcessMap({ analysis, selected, setSelected }) {
-  const maxWeight = Math.max(...Object.values(analysis.edgeFreq));
-  const maxNode = Math.max(...Object.values(analysis.nodeFreq));
+function MetricToggle({ metric, setMetric }) {
+  return (
+    <div className="metric-toggle">
+      <button className={metric === "count" ? "active" : ""} onClick={() => setMetric("count")}>
+        Case frequency
+      </button>
+      <button className={metric === "duration" ? "active" : ""} onClick={() => setMetric("duration")}>
+        Avg. duration
+      </button>
+    </div>
+  );
+}
+
+function ThemeToggle({ theme, setTheme }) {
+  return (
+    <div className="metric-toggle">
+      <button className={theme === "dark" ? "active" : ""} onClick={() => setTheme("dark")}>
+        🌙 Dark
+      </button>
+      <button className={theme === "light" ? "active" : ""} onClick={() => setTheme("light")}>
+        ☀️ Light
+      </button>
+    </div>
+  );
+}
+
+function PlayToggle({ animate, setAnimate }) {
+  return (
+    <button className={`play-toggle ${animate ? "on" : ""}`} onClick={() => setAnimate(!animate)}>
+      {animate ? "⏸" : "▶"} {animate ? "Flow animation on" : "Flow animation off"}
+    </button>
+  );
+}
+
+function ProcessMap({
+  nodeFreq,
+  edgeFreq,
+  nodeAvgDur,
+  edgeAvgDur,
+  metric = "count",
+  selected,
+  setSelected,
+  visibleNodes,
+  visibleEdges,
+  animate = false,
+}) {
+  const nodeNames = visibleNodes ? Object.keys(META).filter((n) => visibleNodes.has(n)) : Object.keys(META);
+  const edgeEntries = visibleEdges
+    ? Object.entries(edgeFreq).filter(([k]) => visibleEdges.has(k))
+    : Object.entries(edgeFreq);
+
+  const edgeMetricMap = metric === "count" ? edgeFreq : edgeAvgDur;
+  const nodeMetricMap = metric === "count" ? nodeFreq : nodeAvgDur;
+  const edgeVals = edgeEntries.map(([k]) => edgeMetricMap[k]).filter((v) => typeof v === "number" && !Number.isNaN(v));
+  const nodeVals = nodeNames.map((n) => nodeMetricMap[n]).filter((v) => typeof v === "number" && !Number.isNaN(v));
+  const maxEdgeVal = edgeVals.length ? Math.max(...edgeVals) : 1;
+  const maxNodeVal = nodeVals.length ? Math.max(...nodeVals) : 1;
+  const maxNodeFreq = Math.max(...nodeNames.map((n) => nodeFreq[n] || 0), 1);
 
   const relatedEdges = (name) => {
     if (!name) return null;
     const s = new Set();
-    Object.keys(analysis.edgeFreq).forEach((k) => {
+    edgeEntries.forEach(([k]) => {
       const [a, b] = k.split("→");
       if (a === name || b === name) s.add(k);
     });
     return s;
   };
   const rel = relatedEdges(selected);
+  const vb = computeViewBox(visibleNodes);
 
   return (
     <div className="map-scroll">
-      <svg width={CANVAS_W} height={CANVAS_H} className="map-svg">
+      <svg width={vb.w} height={vb.h} viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`} className="map-svg">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="#e8a23a" />
+            <path d="M0,0 L10,5 L0,10 z" fill={metric === "count" ? "var(--amber)" : "var(--teal)"} />
           </marker>
           <marker id="arrowDim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="#3b4a63" />
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--edge-dim)" />
           </marker>
         </defs>
 
-        {Object.entries(analysis.edgeFreq).map(([key, weight]) => {
+        {edgeEntries.map(([key, freqWeight]) => {
           const [a, b] = key.split("→");
-          const { d, strokeW, labelX, labelY } = edgePathAndLabel(a, b, weight, maxWeight);
+          const value = metric === "count" ? freqWeight : edgeAvgDur[key];
+          const { d, strokeW, ratio, labelX, labelY } = edgePathAndLabel(a, b, value || 0, maxEdgeVal);
+          const label = metric === "count" ? String(freqWeight) : fmtDur(edgeAvgDur[key]);
           const dim = rel && !rel.has(key);
+          const strokeColor = dim ? "var(--edge-dim)" : metric === "count" ? "var(--amber)" : metricColor(ratio);
+          const pathId = safeId(key);
+          const dotDur = Math.max(1.3, 5.4 - ratio * 3.8);
           return (
             <g key={key} opacity={dim ? 0.18 : 1}>
               <path
+                id={pathId}
                 d={d}
                 fill="none"
-                stroke={dim ? "#3b4a63" : "#e8a23a"}
+                stroke={strokeColor}
                 strokeWidth={strokeW}
                 markerEnd={dim ? "url(#arrowDim)" : "url(#arrow)"}
               />
+              {animate && !dim && (
+                <circle r={Math.min(4.2, 2.4 + strokeW * 0.25)} fill={strokeColor}>
+                  <animateMotion dur={`${dotDur}s`} repeatCount="indefinite">
+                    <mpath href={`#${pathId}`} />
+                  </animateMotion>
+                </circle>
+              )}
               <rect
                 x={labelX - 13}
                 y={labelY - 10}
-                width={String(weight).length * 8 + 10}
+                width={label.length * 8 + 10}
                 height="18"
                 rx="4"
-                fill="#0b1220"
-                stroke={dim ? "#243146" : "#e8a23a"}
+                fill="var(--panel-2)"
+                stroke={dim ? "var(--border)" : strokeColor}
                 strokeWidth="1"
               />
-              <text x={labelX - 8} y={labelY + 3} fontSize="11" fill={dim ? "#5b6b85" : "#f5c977"} fontFamily="var(--mono)">
-                {weight}
+              <text x={labelX - 8} y={labelY + 3} fontSize="11" fill={dim ? "var(--muted)" : "var(--amber-soft)"} fontFamily="var(--mono)">
+                {label}
               </text>
             </g>
           );
         })}
 
-        {Object.keys(META).map((name) => {
+        {nodeNames.map((name) => {
           const { x, y } = nodePos(name);
           const colors = TYPE_COLOR[META[name].type];
-          const freq = analysis.nodeFreq[name] || 0;
+          const freq = nodeFreq[name] || 0;
           const isSel = selected === name;
           const dim = selected && !isSel && rel && !rel.has(name);
+          const subtitle =
+            metric === "count"
+              ? `${freq} inst · ${((freq / maxNodeFreq) * 100).toFixed(0)}% peak`
+              : nodeAvgDur[name] !== undefined
+              ? `${fmtDur(nodeAvgDur[name])} avg step`
+              : "end of process";
           return (
             <g
               key={name}
@@ -362,14 +528,14 @@ function ProcessMap({ analysis, selected, setSelected }) {
                 height={NODE_H}
                 rx="9"
                 fill={colors.fill}
-                stroke={isSel ? "#f5c977" : colors.stroke}
+                stroke={isSel ? "var(--amber-soft)" : colors.stroke}
                 strokeWidth={isSel ? 2.5 : 1.4}
               />
               <text x={NODE_W / 2} y={22} textAnchor="middle" fontSize="12.5" fontWeight="600" fill={colors.text} fontFamily="var(--body)">
                 {name}
               </text>
-              <text x={NODE_W / 2} y={39} textAnchor="middle" fontSize="10.5" fill="#7c8ca6" fontFamily="var(--mono)">
-                {freq} inst · {((freq / maxNode) * 100).toFixed(0)}% peak
+              <text x={NODE_W / 2} y={39} textAnchor="middle" fontSize="10.5" fill="var(--muted)" fontFamily="var(--mono)">
+                {subtitle}
               </text>
             </g>
           );
@@ -379,35 +545,64 @@ function ProcessMap({ analysis, selected, setSelected }) {
   );
 }
 
-function VariantsView({ analysis }) {
+function VariantsView({ analysis, mapMetric, setMapMetric, animate, setAnimate }) {
   const [expanded, setExpanded] = useState(null);
   const max = analysis.variants[0].count;
   return (
     <div className="variants-list">
-      {analysis.variants.map((v, i) => (
-        <div className="variant-row" key={v.key}>
-          <div className="variant-head" onClick={() => setExpanded(expanded === i ? null : i)}>
-            <span className="variant-rank">#{i + 1}</span>
-            <div className="variant-bar-track">
-              <div className="variant-bar-fill" style={{ width: `${(v.count / max) * 100}%` }} />
-            </div>
-            <span className="variant-count">{v.count} cases</span>
-            <span className="variant-pct">{((v.count / analysis.totalCases) * 100).toFixed(0)}%</span>
-            <span className="variant-steps-count">{v.steps.length} steps</span>
-            <span className="chevron">{expanded === i ? "▾" : "▸"}</span>
-          </div>
-          {expanded === i && (
-            <div className="variant-trace">
-              {v.steps.map((s, j) => (
-                <React.Fragment key={j}>
-                  <span className={`trace-chip type-${META[s].type}`}>{s}</span>
-                  {j < v.steps.length - 1 && <span className="trace-arrow">→</span>}
-                </React.Fragment>
-              ))}
-            </div>
-          )}
+      <div className="variants-toolbar">
+        <p className="panel-sub" style={{ margin: 0 }}>
+          Expand a variant to see its own trace and directly-follows subgraph
+        </p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <PlayToggle animate={animate} setAnimate={setAnimate} />
+          <MetricToggle metric={mapMetric} setMetric={setMapMetric} />
         </div>
-      ))}
+      </div>
+      {analysis.variants.map((v, i) => {
+        const visibleNodes = new Set(v.steps);
+        const visibleEdges = new Set(Object.keys(v.edgeFreq));
+        return (
+          <div className="variant-row" key={v.key}>
+            <div className="variant-head" onClick={() => setExpanded(expanded === i ? null : i)}>
+              <span className="variant-rank">#{i + 1}</span>
+              <div className="variant-bar-track">
+                <div className="variant-bar-fill" style={{ width: `${(v.count / max) * 100}%` }} />
+              </div>
+              <span className="variant-count">{v.count} cases</span>
+              <span className="variant-pct">{((v.count / analysis.totalCases) * 100).toFixed(0)}%</span>
+              <span className="variant-steps-count">{v.steps.length} steps</span>
+              <span className="chevron">{expanded === i ? "▾" : "▸"}</span>
+            </div>
+            {expanded === i && (
+              <>
+                <div className="variant-trace">
+                  {v.steps.map((s, j) => (
+                    <React.Fragment key={j}>
+                      <span className={`trace-chip type-${META[s].type}`}>{s}</span>
+                      {j < v.steps.length - 1 && <span className="trace-arrow">→</span>}
+                    </React.Fragment>
+                  ))}
+                </div>
+                <div className="variant-map">
+                  <ProcessMap
+                    nodeFreq={v.nodeFreq}
+                    edgeFreq={v.edgeFreq}
+                    nodeAvgDur={v.nodeAvgDur}
+                    edgeAvgDur={v.edgeAvgDur}
+                    metric={mapMetric}
+                    selected={null}
+                    setSelected={() => {}}
+                    visibleNodes={visibleNodes}
+                    visibleEdges={visibleEdges}
+                    animate={animate}
+                  />
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -510,43 +705,238 @@ function ActivityFrequency({ analysis }) {
   );
 }
 
+function ActivityFilterBar({ allActivities, activityFilter, toggleActivity, clearFilter, matchCount, totalCount }) {
+  return (
+    <div className="filter-bar">
+      <span className="filter-bar-label">Must include:</span>
+      {allActivities.map((name) => (
+        <button
+          key={name}
+          className={`filter-chip ${activityFilter.has(name) ? "active" : ""}`}
+          onClick={() => toggleActivity(name)}
+        >
+          {name}
+        </button>
+      ))}
+      <span className="filter-summary">
+        {activityFilter.size > 0 && (
+          <>
+            <span>
+              {matchCount} of {totalCount} cases match
+            </span>
+            <button className="filter-clear" onClick={clearFilter}>
+              Clear filters
+            </button>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function CaseViewerView({ cases, analysis }) {
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState(cases[0] ? cases[0].caseId : null);
+
+  const filteredList = useMemo(() => {
+    if (!query.trim()) return cases;
+    const q = query.trim().toLowerCase();
+    return cases.filter((c) => c.caseId.toLowerCase().includes(q));
+  }, [cases, query]);
+
+  const selectedCase = cases.find((c) => c.caseId === selectedId) || cases[0];
+
+  if (!selectedCase) {
+    return <div className="empty-state">No cases match the current filters.</div>;
+  }
+
+  const events = selectedCase.events;
+  const traceKey = events.map((e) => e.activity).join(" → ");
+  const variantIdx = analysis.variants.findIndex((v) => v.key === traceKey);
+  const variant = variantIdx >= 0 ? analysis.variants[variantIdx] : null;
+  const totalHours = (events[events.length - 1].timestamp.getTime() - events[0].timestamp.getTime()) / (3600 * 1000);
+
+  return (
+    <div className="case-viewer">
+      <div className="case-list-panel">
+        <input
+          className="case-list-search"
+          placeholder="Search case ID…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <div className="case-list">
+          {filteredList.map((c) => (
+            <button
+              key={c.caseId}
+              className={`case-list-item ${c.caseId === selectedCase.caseId ? "active" : ""}`}
+              onClick={() => setSelectedId(c.caseId)}
+            >
+              <span>{c.caseId}</span>
+              <span>{c.events.length} steps</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="case-detail">
+        <div className="case-detail-head">
+          <div>
+            <h3>{selectedCase.caseId}</h3>
+            <div className="case-variant-badge">
+              {variant
+                ? variant.count === 1
+                  ? "Unique trace — no other case follows this exact path"
+                  : `Follows variant #${variantIdx + 1} · shared with ${variant.count - 1} other case(s) · ${((variant.count / analysis.totalCases) * 100).toFixed(0)}% of cases`
+                : "Trace not found in current variant set"}
+            </div>
+          </div>
+          <div className="case-kpis">
+            <div><span className="n">{events.length}</span><span className="l">Steps</span></div>
+            <div><span className="n">{fmtDur(totalHours)}</span><span className="l">Total time</span></div>
+          </div>
+        </div>
+
+        <div className="case-timeline">
+          {events.map((e, i) => {
+            const colors = TYPE_COLOR[META[e.activity].type];
+            const next = events[i + 1];
+            const gapH = next ? (next.timestamp.getTime() - e.timestamp.getTime()) / (3600 * 1000) : null;
+            return (
+              <React.Fragment key={i}>
+                <div className="tl-row">
+                  <div className="tl-dot" style={{ background: colors.stroke }} />
+                  <div className="tl-content">
+                    <div className="tl-activity" style={{ color: colors.text }}>
+                      {e.activity}
+                    </div>
+                    <div className="tl-meta">
+                      {e.timestamp.toLocaleString(undefined, {
+                        month: "short",
+                        day: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}{" "}
+                      · {e.resource}
+                    </div>
+                  </div>
+                </div>
+                {gapH !== null && <div className="tl-gap">↓ {fmtDur(gapH)} later</div>}
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------
    ROOT
 --------------------------------------------------------------- */
 
 function ProcessMiningExplorer() {
   const cases = useMemo(() => buildLog(), []);
-  const analysis = useMemo(() => analyze(cases), [cases]);
   const [tab, setTab] = useState("overview");
   const [selectedNode, setSelectedNode] = useState(null);
+  const [mapMetric, setMapMetric] = useState("count");
+  const [theme, setTheme] = useState("dark");
+  const [animate, setAnimate] = useState(true);
+  const [activityFilter, setActivityFilter] = useState(() => new Set());
+
+  const allActivities = Object.keys(META);
+
+  const toggleActivity = (name) => {
+    setActivityFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+  const clearFilter = () => setActivityFilter(new Set());
+
+  const filteredCases = useMemo(() => {
+    if (activityFilter.size === 0) return cases;
+    return cases.filter((c) => {
+      const acts = new Set(c.events.map((e) => e.activity));
+      return [...activityFilter].every((a) => acts.has(a));
+    });
+  }, [cases, activityFilter]);
+
+  const analysis = useMemo(() => analyze(filteredCases), [filteredCases]);
 
   const tabs = [
     { id: "overview", label: "Overview" },
     { id: "map", label: "Process Map" },
     { id: "variants", label: "Variants" },
+    { id: "cases", label: "Case Viewer" },
     { id: "log", label: "Event Log" },
   ];
 
+  if (filteredCases.length === 0) {
+    return (
+      <div className={`pm-root theme-${theme}`}>
+        <style>{`.pm-root.theme-${theme} { background: ${theme === "dark" ? "#0b1220" : "#f4f6fb"}; color: ${theme === "dark" ? "#e6edf5" : "#17202e"}; min-height: 100vh; padding: 40px; font-family: system-ui, sans-serif; }`}</style>
+        <p>No cases match the selected activity filters.</p>
+        <button className="filter-clear" onClick={clearFilter} style={{ color: theme === "dark" ? "#f5c977" : "#9c5e0a" }}>
+          Clear filters
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div className="pm-root">
+    <div className={`pm-root theme-${theme}`}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
         .pm-root {
+          --amber: #e8a23a;
+          --amber-soft: #f5c977;
+          --teal: #2dd4bf;
+          --green: #34d399;
+          --red: #e0607c;
+          --edge-dim: #3b4a63;
+          --display: 'Space Grotesk', sans-serif;
+          --body: 'Inter', system-ui, sans-serif;
+          --mono: 'IBM Plex Mono', 'SFMono-Regular', monospace;
+
+          --type-start-fill: #123832; --type-start-stroke: #2dd4bf; --type-start-text: #5eead4;
+          --type-normal-fill: #131d2e; --type-normal-stroke: #39527a; --type-normal-text: #c9d6ea;
+          --type-exception-fill: #2e2410; --type-exception-stroke: #d9a13a; --type-exception-text: #f5c977;
+          --type-endbad-fill: #301620; --type-endbad-stroke: #e0607c; --type-endbad-text: #f6a3b6;
+          --type-endgood-fill: #0f2b1c; --type-endgood-stroke: #34d399; --type-endgood-text: #7bf0bb;
+        }
+        .pm-root.theme-dark {
           --bg: #0b1220;
           --panel: #111a2b;
           --panel-2: #0e1626;
           --border: #1f2c40;
           --text: #e6edf5;
           --muted: #8494ac;
-          --amber: #e8a23a;
-          --amber-soft: #f5c977;
-          --teal: #2dd4bf;
-          --green: #34d399;
-          --red: #e0607c;
-          --display: 'Space Grotesk', sans-serif;
-          --body: 'Inter', system-ui, sans-serif;
-          --mono: 'IBM Plex Mono', 'SFMono-Regular', monospace;
+        }
+        .pm-root.theme-light {
+          --bg: #f4f6fb;
+          --panel: #ffffff;
+          --panel-2: #eef1f7;
+          --border: #dde3ee;
+          --text: #17202e;
+          --muted: #5b6b85;
+          --amber: #b9720d;
+          --amber-soft: #9c5e0a;
+          --teal: #0e8f82;
+          --green: #16875f;
+          --red: #c23f5e;
+          --edge-dim: #c9d1e0;
+
+          --type-start-fill: #e3faf6; --type-start-stroke: #0e9488; --type-start-text: #0b6f65;
+          --type-normal-fill: #eef1f8; --type-normal-stroke: #5b7297; --type-normal-text: #28405f;
+          --type-exception-fill: #fdf1dc; --type-exception-stroke: #b9790f; --type-exception-text: #8a5808;
+          --type-endbad-fill: #fbe6ec; --type-endbad-stroke: #c23f5e; --type-endbad-text: #9c2c46;
+          --type-endgood-fill: #e3f7ec; --type-endgood-stroke: #16875f; --type-endgood-text: #0f6146;
+        }
+        .pm-root {
           background:
             radial-gradient(circle at 15% 0%, rgba(45,212,191,0.06), transparent 45%),
             radial-gradient(circle at 85% 100%, rgba(232,162,58,0.06), transparent 45%),
@@ -556,6 +946,7 @@ function ProcessMiningExplorer() {
           min-height: 100vh;
           padding: 28px 30px 40px;
           box-sizing: border-box;
+          transition: background 0.2s ease, color 0.2s ease;
         }
         .pm-root * { box-sizing: border-box; }
 
@@ -600,9 +991,17 @@ function ProcessMiningExplorer() {
 
         .map-scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 8px; }
         .map-svg { display: block; }
-        .map-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0 22px; font-size: 12px; color: var(--muted); }
+        .map-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0 12px; font-size: 12px; color: var(--muted); align-items: center; }
         .map-legend span { display: inline-flex; align-items: center; gap: 6px; }
         .legend-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+        .metric-toggle { display: inline-flex; gap: 3px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 3px; }
+        .metric-toggle button { font-family: var(--body); font-weight: 600; font-size: 12px; padding: 7px 13px; border-radius: 6px; cursor: pointer; color: var(--muted); border: none; background: transparent; transition: all 0.15s ease; }
+        .metric-toggle button:hover { color: var(--text); }
+        .metric-toggle button.active { background: var(--panel); color: var(--amber-soft); box-shadow: 0 0 0 1px var(--border); }
+
+        .variants-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 4px; flex-wrap: wrap; }
+        .variant-map { padding: 0 16px 16px; }
 
         .variants-list { display: flex; flex-direction: column; gap: 8px; }
         .variant-row { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
@@ -634,6 +1033,46 @@ function ProcessMiningExplorer() {
         .mono { font-family: var(--mono); }
         .dim { color: var(--muted); }
         .log-footnote { margin-top: 10px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+
+        .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 20px; padding: 13px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }
+        .filter-bar-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-right: 4px; }
+        .filter-chip { font-family: var(--body); font-size: 11.5px; font-weight: 500; padding: 5px 11px; border-radius: 999px; cursor: pointer; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); transition: all 0.15s ease; }
+        .filter-chip:hover { color: var(--text); border-color: var(--muted); }
+        .filter-chip.active { background: var(--amber); border-color: var(--amber); color: #1a1206; font-weight: 700; }
+        .filter-summary { margin-left: auto; font-size: 11.5px; color: var(--muted); font-family: var(--mono); display: flex; align-items: center; gap: 10px; }
+        .filter-clear { font-family: var(--body); font-size: 11.5px; font-weight: 600; color: var(--red); background: transparent; border: none; cursor: pointer; padding: 0; }
+        .filter-clear:hover { text-decoration: underline; }
+
+        .play-toggle { display: inline-flex; align-items: center; gap: 7px; font-family: var(--body); font-weight: 600; font-size: 12px; padding: 8px 14px; border-radius: 9px; cursor: pointer; color: var(--muted); border: 1px solid var(--border); background: var(--panel-2); transition: all 0.15s ease; }
+        .play-toggle:hover { color: var(--text); }
+        .play-toggle.on { color: var(--amber-soft); border-color: var(--amber); }
+        .map-toolbar { margin-bottom: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+        .case-viewer { display: grid; grid-template-columns: 250px 1fr; gap: 16px; align-items: start; }
+        @media (max-width: 800px) { .case-viewer { grid-template-columns: 1fr; } }
+        .case-list-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }
+        .case-list-search { width: 100%; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; color: var(--text); font-family: var(--body); font-size: 12.5px; outline: none; margin-bottom: 10px; }
+        .case-list-search:focus { border-color: var(--amber); }
+        .case-list { max-height: 560px; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+        .case-list-item { text-align: left; font-family: var(--mono); font-size: 12px; padding: 8px 10px; border-radius: 7px; background: transparent; border: none; color: var(--muted); cursor: pointer; display: flex; justify-content: space-between; }
+        .case-list-item:hover { background: var(--panel-2); color: var(--text); }
+        .case-list-item.active { background: var(--panel-2); color: var(--amber-soft); box-shadow: inset 2px 0 0 var(--amber); }
+        .case-detail { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
+        .case-detail-head { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px; margin-bottom: 18px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+        .case-detail-head h3 { font-family: var(--display); font-size: 18px; margin: 0 0 6px; }
+        .case-variant-badge { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+        .case-kpis { display: flex; gap: 20px; font-family: var(--mono); }
+        .case-kpis div { text-align: right; }
+        .case-kpis .n { font-size: 16px; font-weight: 600; color: var(--amber-soft); display: block; }
+        .case-kpis .l { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+        .case-timeline { display: flex; flex-direction: column; }
+        .tl-row { display: flex; gap: 13px; align-items: flex-start; }
+        .tl-dot { width: 13px; height: 13px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; box-shadow: 0 0 0 3px var(--panel); }
+        .tl-content { flex: 1; padding-bottom: 2px; }
+        .tl-activity { font-size: 13.5px; font-weight: 600; }
+        .tl-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+        .tl-gap { margin-left: 6px; padding-left: 24px; border-left: 1px dashed var(--border); font-size: 11px; color: var(--muted); font-family: var(--mono); padding-top: 4px; padding-bottom: 4px; }
+        .empty-state { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; }
       `}</style>
 
       <div className="pm-header">
@@ -642,10 +1081,13 @@ function ProcessMiningExplorer() {
           <h1>Order Fulfillment Process Explorer</h1>
           <p>100 simulated orders replayed as an event log — directly-follows graph, variant breakdown, and raw trace inspection.</p>
         </div>
-        <div className="pm-header-stats">
-          <div><span className="n">{analysis.totalCases}</span><span className="l">Cases</span></div>
-          <div><span className="n">{analysis.totalEvents}</span><span className="l">Events</span></div>
-          <div><span className="n">{analysis.variants.length}</span><span className="l">Variants</span></div>
+        <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
+          <div className="pm-header-stats">
+            <div><span className="n">{analysis.totalCases}</span><span className="l">Cases</span></div>
+            <div><span className="n">{analysis.totalEvents}</span><span className="l">Events</span></div>
+            <div><span className="n">{analysis.variants.length}</span><span className="l">Variants</span></div>
+          </div>
+          <ThemeToggle theme={theme} setTheme={setTheme} />
         </div>
       </div>
 
@@ -656,6 +1098,15 @@ function ProcessMiningExplorer() {
           </button>
         ))}
       </div>
+
+      <ActivityFilterBar
+        allActivities={allActivities}
+        activityFilter={activityFilter}
+        toggleActivity={toggleActivity}
+        clearFilter={clearFilter}
+        matchCount={filteredCases.length}
+        totalCount={cases.length}
+      />
 
       {tab === "overview" && (
         <>
@@ -691,20 +1142,42 @@ function ProcessMiningExplorer() {
       {tab === "map" && (
         <>
           <div className="map-legend">
-            <span><i className="legend-dot" style={{ background: "#2dd4bf" }} /> Start</span>
-            <span><i className="legend-dot" style={{ background: "#39527a" }} /> Standard activity</span>
-            <span><i className="legend-dot" style={{ background: "#d9a13a" }} /> Exception / rework</span>
-            <span><i className="legend-dot" style={{ background: "#e0607c" }} /> Negative end</span>
-            <span><i className="legend-dot" style={{ background: "#34d399" }} /> Positive end</span>
-            <span style={{ marginLeft: "auto" }}>Edge thickness &amp; label = transition frequency · click a node to isolate its flows</span>
+            <span><i className="legend-dot" style={{ background: "var(--type-start-stroke)" }} /> Start</span>
+            <span><i className="legend-dot" style={{ background: "var(--type-normal-stroke)" }} /> Standard activity</span>
+            <span><i className="legend-dot" style={{ background: "var(--type-exception-stroke)" }} /> Exception / rework</span>
+            <span><i className="legend-dot" style={{ background: "var(--type-endbad-stroke)" }} /> Negative end</span>
+            <span><i className="legend-dot" style={{ background: "var(--type-endgood-stroke)" }} /> Positive end</span>
+            <span style={{ marginLeft: "auto" }}>
+              {mapMetric === "count"
+                ? "Edge thickness & label = transition frequency"
+                : "Edge thickness, color & label = average transition duration"}{" "}
+              · click a node to isolate its flows
+            </span>
           </div>
-          <ProcessMap analysis={analysis} selected={selectedNode} setSelected={setSelectedNode} />
+          <div className="map-toolbar">
+            <PlayToggle animate={animate} setAnimate={setAnimate} />
+            <MetricToggle metric={mapMetric} setMetric={setMapMetric} />
+          </div>
+          <ProcessMap
+            nodeFreq={analysis.nodeFreq}
+            edgeFreq={analysis.edgeFreq}
+            nodeAvgDur={analysis.nodeAvgDur}
+            edgeAvgDur={analysis.edgeAvgDur}
+            metric={mapMetric}
+            selected={selectedNode}
+            setSelected={setSelectedNode}
+            animate={animate}
+          />
         </>
       )}
 
-      {tab === "variants" && <VariantsView analysis={analysis} />}
+      {tab === "variants" && (
+        <VariantsView analysis={analysis} mapMetric={mapMetric} setMapMetric={setMapMetric} animate={animate} setAnimate={setAnimate} />
+      )}
 
-      {tab === "log" && <EventLogView cases={cases} />}
+      {tab === "cases" && <CaseViewerView cases={filteredCases} analysis={analysis} />}
+
+      {tab === "log" && <EventLogView cases={filteredCases} />}
     </div>
   );
 }
@@ -714,8 +1187,6 @@ root.render(<ProcessMiningExplorer />);
 </script>
 
 <script>
-  // Manually transform with the classic JSX runtime so the output has no
-  // ES module "import" statements (which a plain <script> can't execute).
   var source = document.getElementById("app-source").textContent;
   var compiled = Babel.transform(source, {
     presets: [["react", { runtime: "classic" }]],
