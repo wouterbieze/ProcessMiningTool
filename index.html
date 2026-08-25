@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Process Mining Explorer — Order-to-Cash</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b1220; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useMemo, useState } = React;
+
+/* ---------------------------------------------------------------
+   DATA GENERATION — dummy order-to-cash event log (100 cases)
+--------------------------------------------------------------- */
+
+function mulberry32(seed) {
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(20260811);
+const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+const weightedPick = (options) => {
+  if (!options || options.length === 0) return null;
+  const total = options.reduce((s, o) => s + o[1], 0);
+  let r = rand() * total;
+  for (const [val, w] of options) {
+    if (r < w) return val;
+    r -= w;
+  }
+  return options[options.length - 1][0];
+};
+const randRange = (min, max) => min + rand() * (max - min);
+
+const META = {
+  "Create Order": { level: 0, type: "start", resource: "Sales Team", dur: [0, 1] },
+  "Check Credit": { level: 1, type: "normal", resource: "Credit Dept", dur: [1, 6] },
+  "Check Stock": { level: 2, type: "normal", resource: "Warehouse", dur: [1, 4] },
+  "Reject Order": { level: 2, type: "end-bad", resource: "Credit Dept", dur: [0, 1] },
+  "Pick Items": { level: 3, type: "normal", resource: "Warehouse", dur: [2, 10] },
+  "Backorder Item": { level: 3, type: "exception", resource: "Warehouse", dur: [12, 72] },
+  "Rework Order": { level: 4, type: "exception", resource: "Warehouse", dur: [4, 24] },
+  "Cancel Order": { level: 4, type: "end-bad", resource: "Sales Team", dur: [0, 2] },
+  "Pack Items": { level: 5, type: "normal", resource: "Warehouse", dur: [1, 4] },
+  "Ship Goods": { level: 6, type: "normal", resource: "Logistics", dur: [4, 12] },
+  "Create Invoice": { level: 7, type: "normal", resource: "Finance", dur: [0, 2] },
+  "Send Invoice": { level: 8, type: "normal", resource: "Finance", dur: [0, 1] },
+  "Receive Payment": { level: 9, type: "normal", resource: "Finance", dur: [24, 120] },
+  "Deliver Order": { level: 10, type: "normal", resource: "Logistics", dur: [24, 96] },
+  "Return Goods": { level: 11, type: "exception", resource: "Customer Service", dur: [24, 72] },
+  "Issue Refund": { level: 12, type: "exception", resource: "Finance", dur: [4, 24] },
+  "Close Order": { level: 13, type: "end-good", resource: "Sales Team", dur: [0, 1] },
+};
+
+const TRANSITIONS = {
+  "Create Order": [["Check Credit", 1]],
+  "Check Credit": [
+    ["Check Stock", 0.85],
+    ["Reject Order", 0.15],
+  ],
+  "Reject Order": [],
+  "Check Stock": [
+    ["Pick Items", 0.8],
+    ["Backorder Item", 0.2],
+  ],
+  "Backorder Item": [
+    ["Pick Items", 0.85],
+    ["Cancel Order", 0.15],
+  ],
+  "Cancel Order": [],
+  "Pick Items": [
+    ["Pack Items", 0.92],
+    ["Rework Order", 0.08],
+  ],
+  "Rework Order": [["Pick Items", 1]],
+  "Pack Items": [["Ship Goods", 1]],
+  "Ship Goods": [["Create Invoice", 1]],
+  "Create Invoice": [["Send Invoice", 1]],
+  "Send Invoice": [
+    ["Receive Payment", 0.88],
+    ["Send Invoice", 0.12],
+  ],
+  "Receive Payment": [["Deliver Order", 1]],
+  "Deliver Order": [
+    ["Close Order", 0.9],
+    ["Return Goods", 0.1],
+  ],
+  "Return Goods": [["Issue Refund", 1]],
+  "Issue Refund": [["Close Order", 1]],
+  "Close Order": [],
+};
+
+function generateCase(caseId, startTime) {
+  const trace = [];
+  let current = "Create Order";
+  let t = startTime;
+  let reminderCount = 0;
+  let guard = 0;
+  while (current && guard < 25) {
+    guard++;
+    const [min, max] = META[current].dur;
+    trace.push({ activity: current, timestamp: new Date(t), resource: META[current].resource });
+    t += randRange(min, max) * 3600 * 1000;
+
+    if (!TRANSITIONS[current] || TRANSITIONS[current].length === 0) break;
+
+    let next = weightedPick(TRANSITIONS[current]);
+    if (current === "Send Invoice" && next === "Send Invoice") {
+      reminderCount++;
+      if (reminderCount > 2) next = "Receive Payment";
+    }
+    current = next;
+  }
+  return trace.map((e, i) => ({
+    caseId,
+    index: i,
+    activity: e.activity,
+    timestamp: e.timestamp,
+    resource: e.resource,
+  }));
+}
+
+function buildLog() {
+  const now = new Date("2026-08-11T09:00:00");
+  const cases = [];
+  for (let i = 0; i < 100; i++) {
+    const caseId = `ORD-${1000 + i}`;
+    const startOffsetDays = randRange(1, 55);
+    const start = now.getTime() - startOffsetDays * 24 * 3600 * 1000;
+    cases.push({ caseId, events: generateCase(caseId, start) });
+  }
+  return cases;
+}
+
+/* ---------------------------------------------------------------
+   ANALYSIS HELPERS
+--------------------------------------------------------------- */
+
+function analyze(cases) {
+  const events = cases.flatMap((c) => c.events);
+  const nodeFreq = {};
+  const edgeFreq = {};
+  const durations = [];
+  const endActivity = { "Close Order": 0, "Reject Order": 0, "Cancel Order": 0, other: 0 };
+
+  cases.forEach((c) => {
+    const acts = c.events.map((e) => e.activity);
+    acts.forEach((a) => (nodeFreq[a] = (nodeFreq[a] || 0) + 1));
+    for (let i = 0; i < acts.length - 1; i++) {
+      const key = acts[i] + "→" + acts[i + 1];
+      edgeFreq[key] = (edgeFreq[key] || 0) + 1;
+    }
+    const first = c.events[0].timestamp.getTime();
+    const last = c.events[c.events.length - 1].timestamp.getTime();
+    durations.push((last - first) / (3600 * 1000));
+    const last_act = acts[acts.length - 1];
+    if (endActivity[last_act] !== undefined) endActivity[last_act]++;
+    else endActivity.other++;
+  });
+
+  const variantMap = {};
+  cases.forEach((c) => {
+    const key = c.events.map((e) => e.activity).join(" → ");
+    if (!variantMap[key]) variantMap[key] = { key, count: 0, steps: c.events.map((e) => e.activity) };
+    variantMap[key].count++;
+  });
+  const variants = Object.values(variantMap).sort((a, b) => b.count - a.count);
+
+  const avgDuration = durations.reduce((s, d) => s + d, 0) / durations.length;
+  const avgEvents = events.length / cases.length;
+
+  return {
+    events,
+    nodeFreq,
+    edgeFreq,
+    variants,
+    avgDuration,
+    avgEvents,
+    totalEvents: events.length,
+    totalCases: cases.length,
+    completionRate: (endActivity["Close Order"] / cases.length) * 100,
+    exceptionRate:
+      ((endActivity["Reject Order"] + endActivity["Cancel Order"]) / cases.length) * 100,
+  };
+}
+
+/* ---------------------------------------------------------------
+   PROCESS MAP LAYOUT
+--------------------------------------------------------------- */
+
+const LEVEL_GROUPS = (() => {
+  const g = {};
+  Object.entries(META).forEach(([name, m]) => {
+    g[m.level] = g[m.level] || [];
+    g[m.level].push(name);
+  });
+  return g;
+})();
+const MAX_LEVEL = Math.max(...Object.values(META).map((m) => m.level));
+const MAX_PER_LEVEL = Math.max(...Object.values(LEVEL_GROUPS).map((a) => a.length));
+
+const NODE_W = 138;
+const NODE_H = 54;
+const COL_GAP = 168;
+const ROW_GAP = 118;
+const CANVAS_H = MAX_PER_LEVEL * ROW_GAP + 160;
+const CANVAS_W = (MAX_LEVEL + 1) * COL_GAP + 80;
+
+function nodePos(name) {
+  const m = META[name];
+  const group = LEVEL_GROUPS[m.level];
+  const idx = group.indexOf(name);
+  const n = group.length;
+  const x = 70 + m.level * COL_GAP;
+  const centerY = CANVAS_H / 2;
+  const y = centerY - ((n - 1) * ROW_GAP) / 2 + idx * ROW_GAP;
+  return { x, y };
+}
+
+const TYPE_COLOR = {
+  start: { fill: "#123832", stroke: "#2dd4bf", text: "#5eead4" },
+  normal: { fill: "#131d2e", stroke: "#39527a", text: "#c9d6ea" },
+  exception: { fill: "#2e2410", stroke: "#d9a13a", text: "#f5c977" },
+  "end-bad": { fill: "#301620", stroke: "#e0607c", text: "#f6a3b6" },
+  "end-good": { fill: "#0f2b1c", stroke: "#34d399", text: "#7bf0bb" },
+};
+
+function edgePathAndLabel(a, b, weight, maxWeight) {
+  const p1 = nodePos(a);
+  const p2 = nodePos(b);
+  const isSelf = a === b;
+  const forward = META[b].level > META[a].level;
+  const x1 = p1.x + NODE_W;
+  const y1 = p1.y;
+  const x2 = p2.x;
+  const y2 = p2.y;
+  const strokeW = 1.4 + (weight / maxWeight) * 6.5;
+
+  if (isSelf) {
+    const d = `M ${p1.x + NODE_W * 0.28} ${p1.y - NODE_H / 2}
+      C ${p1.x + NODE_W * 0.1} ${p1.y - NODE_H - 34}, ${p1.x + NODE_W * 0.9} ${p1.y - NODE_H - 34}, ${p1.x + NODE_W * 0.72} ${p1.y - NODE_H / 2}`;
+    return { d, strokeW, labelX: p1.x + NODE_W / 2, labelY: p1.y - NODE_H - 30 };
+  }
+  if (forward) {
+    const midX = (x1 + x2) / 2;
+    const d = `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
+    return { d, strokeW, labelX: midX, labelY: (y1 + y2) / 2 };
+  }
+  // backward / same-level loop edge — arc below
+  const bulge = 90 + Math.abs(META[a].level - META[b].level) * 4;
+  const sx = p1.x + NODE_W / 2;
+  const sy = p1.y + NODE_H / 2;
+  const tx = p2.x + NODE_W / 2;
+  const ty = p2.y + NODE_H / 2;
+  const midX = (sx + tx) / 2;
+  const d = `M ${sx} ${sy} C ${sx} ${sy + bulge}, ${tx} ${ty + bulge}, ${tx} ${ty}`;
+  return { d, strokeW, labelX: midX, labelY: Math.max(sy, ty) + bulge * 0.72 };
+}
+
+/* ---------------------------------------------------------------
+   UI COMPONENTS
+--------------------------------------------------------------- */
+
+function KpiCard({ label, value, sub, accent }) {
+  return (
+    <div className="kpi-card">
+      <div className="kpi-label">{label}</div>
+      <div className="kpi-value" style={accent ? { color: accent } : undefined}>
+        {value}
+      </div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+    </div>
+  );
+}
+
+function ProcessMap({ analysis, selected, setSelected }) {
+  const maxWeight = Math.max(...Object.values(analysis.edgeFreq));
+  const maxNode = Math.max(...Object.values(analysis.nodeFreq));
+
+  const relatedEdges = (name) => {
+    if (!name) return null;
+    const s = new Set();
+    Object.keys(analysis.edgeFreq).forEach((k) => {
+      const [a, b] = k.split("→");
+      if (a === name || b === name) s.add(k);
+    });
+    return s;
+  };
+  const rel = relatedEdges(selected);
+
+  return (
+    <div className="map-scroll">
+      <svg width={CANVAS_W} height={CANVAS_H} className="map-svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#e8a23a" />
+          </marker>
+          <marker id="arrowDim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#3b4a63" />
+          </marker>
+        </defs>
+
+        {Object.entries(analysis.edgeFreq).map(([key, weight]) => {
+          const [a, b] = key.split("→");
+          const { d, strokeW, labelX, labelY } = edgePathAndLabel(a, b, weight, maxWeight);
+          const dim = rel && !rel.has(key);
+          return (
+            <g key={key} opacity={dim ? 0.18 : 1}>
+              <path
+                d={d}
+                fill="none"
+                stroke={dim ? "#3b4a63" : "#e8a23a"}
+                strokeWidth={strokeW}
+                markerEnd={dim ? "url(#arrowDim)" : "url(#arrow)"}
+              />
+              <rect
+                x={labelX - 13}
+                y={labelY - 10}
+                width={String(weight).length * 8 + 10}
+                height="18"
+                rx="4"
+                fill="#0b1220"
+                stroke={dim ? "#243146" : "#e8a23a"}
+                strokeWidth="1"
+              />
+              <text x={labelX - 8} y={labelY + 3} fontSize="11" fill={dim ? "#5b6b85" : "#f5c977"} fontFamily="var(--mono)">
+                {weight}
+              </text>
+            </g>
+          );
+        })}
+
+        {Object.keys(META).map((name) => {
+          const { x, y } = nodePos(name);
+          const colors = TYPE_COLOR[META[name].type];
+          const freq = analysis.nodeFreq[name] || 0;
+          const isSel = selected === name;
+          const dim = selected && !isSel && rel && !rel.has(name);
+          return (
+            <g
+              key={name}
+              transform={`translate(${x}, ${y - NODE_H / 2})`}
+              onClick={() => setSelected(isSel ? null : name)}
+              style={{ cursor: "pointer" }}
+              opacity={dim ? 0.35 : 1}
+            >
+              <rect
+                width={NODE_W}
+                height={NODE_H}
+                rx="9"
+                fill={colors.fill}
+                stroke={isSel ? "#f5c977" : colors.stroke}
+                strokeWidth={isSel ? 2.5 : 1.4}
+              />
+              <text x={NODE_W / 2} y={22} textAnchor="middle" fontSize="12.5" fontWeight="600" fill={colors.text} fontFamily="var(--body)">
+                {name}
+              </text>
+              <text x={NODE_W / 2} y={39} textAnchor="middle" fontSize="10.5" fill="#7c8ca6" fontFamily="var(--mono)">
+                {freq} inst · {((freq / maxNode) * 100).toFixed(0)}% peak
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function VariantsView({ analysis }) {
+  const [expanded, setExpanded] = useState(null);
+  const max = analysis.variants[0].count;
+  return (
+    <div className="variants-list">
+      {analysis.variants.map((v, i) => (
+        <div className="variant-row" key={v.key}>
+          <div className="variant-head" onClick={() => setExpanded(expanded === i ? null : i)}>
+            <span className="variant-rank">#{i + 1}</span>
+            <div className="variant-bar-track">
+              <div className="variant-bar-fill" style={{ width: `${(v.count / max) * 100}%` }} />
+            </div>
+            <span className="variant-count">{v.count} cases</span>
+            <span className="variant-pct">{((v.count / analysis.totalCases) * 100).toFixed(0)}%</span>
+            <span className="variant-steps-count">{v.steps.length} steps</span>
+            <span className="chevron">{expanded === i ? "▾" : "▸"}</span>
+          </div>
+          {expanded === i && (
+            <div className="variant-trace">
+              {v.steps.map((s, j) => (
+                <React.Fragment key={j}>
+                  <span className={`trace-chip type-${META[s].type}`}>{s}</span>
+                  {j < v.steps.length - 1 && <span className="trace-arrow">→</span>}
+                </React.Fragment>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EventLogView({ cases }) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(() => {
+    if (!query.trim()) return cases;
+    const q = query.trim().toLowerCase();
+    return cases.filter((c) => c.caseId.toLowerCase().includes(q));
+  }, [cases, query]);
+
+  const downloadCsv = () => {
+    const rows = [["case_id", "event_index", "activity", "timestamp", "resource"]];
+    cases.forEach((c) =>
+      c.events.forEach((e) =>
+        rows.push([c.caseId, e.index, e.activity, e.timestamp.toISOString(), e.resource])
+      )
+    );
+    const csv = rows.map((r) => r.map((v) => `"${v}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "process_mining_event_log.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="log-wrap">
+      <div className="log-toolbar">
+        <input
+          className="log-search"
+          placeholder="Filter by case ID, e.g. ORD-1004"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <button className="log-export" onClick={downloadCsv}>
+          ⬇ Export CSV
+        </button>
+      </div>
+      <div className="log-table-scroll">
+        <table className="log-table">
+          <thead>
+            <tr>
+              <th>Case ID</th>
+              <th>#</th>
+              <th>Activity</th>
+              <th>Timestamp</th>
+              <th>Resource</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((c) =>
+              c.events.map((e) => (
+                <tr key={c.caseId + e.index}>
+                  <td className="mono">{c.caseId}</td>
+                  <td className="mono dim">{e.index + 1}</td>
+                  <td>
+                    <span className={`trace-chip small type-${META[e.activity].type}`}>{e.activity}</span>
+                  </td>
+                  <td className="mono dim">
+                    {e.timestamp.toLocaleString(undefined, {
+                      month: "short",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </td>
+                  <td className="dim">{e.resource}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="log-footnote">
+        Showing {filtered.reduce((s, c) => s + c.events.length, 0)} events across {filtered.length} case(s)
+      </div>
+    </div>
+  );
+}
+
+function ActivityFrequency({ analysis }) {
+  const entries = Object.entries(analysis.nodeFreq).sort((a, b) => b[1] - a[1]);
+  const max = entries[0][1];
+  return (
+    <div className="freq-list">
+      {entries.map(([name, count]) => (
+        <div className="freq-row" key={name}>
+          <span className={`freq-name type-${META[name].type}`}>{name}</span>
+          <div className="freq-track">
+            <div className="freq-fill" style={{ width: `${(count / max) * 100}%` }} />
+          </div>
+          <span className="freq-count mono">{count}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   ROOT
+--------------------------------------------------------------- */
+
+function ProcessMiningExplorer() {
+  const cases = useMemo(() => buildLog(), []);
+  const analysis = useMemo(() => analyze(cases), [cases]);
+  const [tab, setTab] = useState("overview");
+  const [selectedNode, setSelectedNode] = useState(null);
+
+  const tabs = [
+    { id: "overview", label: "Overview" },
+    { id: "map", label: "Process Map" },
+    { id: "variants", label: "Variants" },
+    { id: "log", label: "Event Log" },
+  ];
+
+  return (
+    <div className="pm-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+        .pm-root {
+          --bg: #0b1220;
+          --panel: #111a2b;
+          --panel-2: #0e1626;
+          --border: #1f2c40;
+          --text: #e6edf5;
+          --muted: #8494ac;
+          --amber: #e8a23a;
+          --amber-soft: #f5c977;
+          --teal: #2dd4bf;
+          --green: #34d399;
+          --red: #e0607c;
+          --display: 'Space Grotesk', sans-serif;
+          --body: 'Inter', system-ui, sans-serif;
+          --mono: 'IBM Plex Mono', 'SFMono-Regular', monospace;
+          background:
+            radial-gradient(circle at 15% 0%, rgba(45,212,191,0.06), transparent 45%),
+            radial-gradient(circle at 85% 100%, rgba(232,162,58,0.06), transparent 45%),
+            var(--bg);
+          color: var(--text);
+          font-family: var(--body);
+          min-height: 100vh;
+          padding: 28px 30px 40px;
+          box-sizing: border-box;
+        }
+        .pm-root * { box-sizing: border-box; }
+
+        .pm-header { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 16px; margin-bottom: 22px; border-bottom: 1px solid var(--border); padding-bottom: 20px; }
+        .pm-title-block .eyebrow { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--amber-soft); margin-bottom: 6px; }
+        .pm-title-block h1 { font-family: var(--display); font-size: 27px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.01em; }
+        .pm-title-block p { margin: 0; color: var(--muted); font-size: 13.5px; max-width: 520px; }
+        .pm-header-stats { display: flex; gap: 22px; font-family: var(--mono); }
+        .pm-header-stats div { text-align: right; }
+        .pm-header-stats .n { font-size: 20px; font-weight: 600; color: var(--amber-soft); display:block; }
+        .pm-header-stats .l { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+
+        .pm-tabs { display: flex; gap: 4px; margin-bottom: 22px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 4px; width: fit-content; }
+        .pm-tab { font-family: var(--body); font-weight: 600; font-size: 13px; padding: 8px 16px; border-radius: 7px; cursor: pointer; color: var(--muted); border: none; background: transparent; transition: all 0.15s ease; }
+        .pm-tab:hover { color: var(--text); }
+        .pm-tab.active { background: var(--panel); color: var(--amber-soft); box-shadow: 0 0 0 1px var(--border); }
+
+        .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
+        .kpi-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+        .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin-bottom: 8px; }
+        .kpi-value { font-family: var(--display); font-size: 26px; font-weight: 700; }
+        .kpi-sub { font-size: 11.5px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+
+        .panel-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 18px; }
+        @media (max-width: 900px) { .panel-grid { grid-template-columns: 1fr; } }
+        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
+        .panel h3 { font-family: var(--display); font-size: 15px; margin: 0 0 4px; }
+        .panel .panel-sub { color: var(--muted); font-size: 12px; margin: 0 0 16px; }
+
+        .freq-list { display: flex; flex-direction: column; gap: 10px; }
+        .freq-row { display: grid; grid-template-columns: 128px 1fr 34px; align-items: center; gap: 10px; }
+        .freq-name { font-size: 12px; }
+        .freq-track { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+        .freq-fill { height: 100%; background: linear-gradient(90deg, var(--teal), var(--amber)); }
+        .freq-count { font-size: 12px; text-align: right; color: var(--muted); }
+
+        .type-start { color: var(--teal); }
+        .type-normal { color: var(--text); }
+        .type-exception { color: var(--amber-soft); }
+        .type-end-bad { color: var(--red); }
+        .type-end-good { color: var(--green); }
+
+        .map-scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 8px; }
+        .map-svg { display: block; }
+        .map-legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0 22px; font-size: 12px; color: var(--muted); }
+        .map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+        .variants-list { display: flex; flex-direction: column; gap: 8px; }
+        .variant-row { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        .variant-head { display: grid; grid-template-columns: 34px 1fr 70px 44px 64px 18px; align-items: center; gap: 12px; padding: 12px 16px; cursor: pointer; }
+        .variant-head:hover { background: var(--panel-2); }
+        .variant-rank { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+        .variant-bar-track { height: 9px; background: var(--panel-2); border-radius: 5px; border: 1px solid var(--border); overflow: hidden; }
+        .variant-bar-fill { height: 100%; background: linear-gradient(90deg, var(--teal), var(--amber)); }
+        .variant-count { font-family: var(--mono); font-size: 12px; color: var(--text); }
+        .variant-pct { font-family: var(--mono); font-size: 12px; color: var(--amber-soft); }
+        .variant-steps-count { font-size: 11px; color: var(--muted); }
+        .chevron { color: var(--muted); text-align: center; }
+        .variant-trace { padding: 4px 16px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding-top: 12px; }
+        .trace-chip { font-size: 11.5px; padding: 4px 9px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); font-family: var(--body); font-weight: 500; }
+        .trace-chip.small { font-size: 11px; padding: 3px 8px; }
+        .trace-arrow { color: var(--muted); font-size: 12px; }
+
+        .log-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px; }
+        .log-toolbar { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+        .log-search { flex: 1; max-width: 320px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-family: var(--body); font-size: 13px; outline: none; }
+        .log-search:focus { border-color: var(--amber); }
+        .log-export { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 14px; color: var(--amber-soft); font-family: var(--body); font-weight: 600; font-size: 12.5px; cursor: pointer; }
+        .log-export:hover { border-color: var(--amber); }
+        .log-table-scroll { max-height: 520px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; }
+        .log-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        .log-table thead th { position: sticky; top: 0; background: var(--panel-2); text-align: left; padding: 10px 14px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); }
+        .log-table td { padding: 8px 14px; border-bottom: 1px solid var(--border); }
+        .log-table tbody tr:hover { background: var(--panel-2); }
+        .mono { font-family: var(--mono); }
+        .dim { color: var(--muted); }
+        .log-footnote { margin-top: 10px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+      `}</style>
+
+      <div className="pm-header">
+        <div className="pm-title-block">
+          <div className="eyebrow">Process Mining · Order-to-Cash</div>
+          <h1>Order Fulfillment Process Explorer</h1>
+          <p>100 simulated orders replayed as an event log — directly-follows graph, variant breakdown, and raw trace inspection.</p>
+        </div>
+        <div className="pm-header-stats">
+          <div><span className="n">{analysis.totalCases}</span><span className="l">Cases</span></div>
+          <div><span className="n">{analysis.totalEvents}</span><span className="l">Events</span></div>
+          <div><span className="n">{analysis.variants.length}</span><span className="l">Variants</span></div>
+        </div>
+      </div>
+
+      <div className="pm-tabs">
+        {tabs.map((t) => (
+          <button key={t.id} className={`pm-tab ${tab === t.id ? "active" : ""}`} onClick={() => setTab(t.id)}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "overview" && (
+        <>
+          <div className="kpi-grid">
+            <KpiCard label="Completion rate" value={`${analysis.completionRate.toFixed(0)}%`} sub="reached Close Order" accent="var(--green)" />
+            <KpiCard label="Exception rate" value={`${analysis.exceptionRate.toFixed(0)}%`} sub="rejected or cancelled" accent="var(--red)" />
+            <KpiCard label="Avg case duration" value={`${(analysis.avgDuration / 24).toFixed(1)}d`} sub={`${analysis.avgDuration.toFixed(0)} hours`} />
+            <KpiCard label="Avg events / case" value={analysis.avgEvents.toFixed(1)} sub="activity steps" />
+            <KpiCard label="Top variant share" value={`${((analysis.variants[0].count / analysis.totalCases) * 100).toFixed(0)}%`} sub={`${analysis.variants[0].count} of ${analysis.totalCases} cases`} accent="var(--amber-soft)" />
+          </div>
+          <div className="panel-grid">
+            <div className="panel">
+              <h3>Happy path</h3>
+              <p className="panel-sub">Most frequent end-to-end variant in the log</p>
+              <div className="variant-trace" style={{ borderTop: "none", paddingTop: 0 }}>
+                {analysis.variants[0].steps.map((s, j) => (
+                  <React.Fragment key={j}>
+                    <span className={`trace-chip type-${META[s].type}`}>{s}</span>
+                    {j < analysis.variants[0].steps.length - 1 && <span className="trace-arrow">→</span>}
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+            <div className="panel">
+              <h3>Activity frequency</h3>
+              <p className="panel-sub">Instances per activity across all cases</p>
+              <ActivityFrequency analysis={analysis} />
+            </div>
+          </div>
+        </>
+      )}
+
+      {tab === "map" && (
+        <>
+          <div className="map-legend">
+            <span><i className="legend-dot" style={{ background: "#2dd4bf" }} /> Start</span>
+            <span><i className="legend-dot" style={{ background: "#39527a" }} /> Standard activity</span>
+            <span><i className="legend-dot" style={{ background: "#d9a13a" }} /> Exception / rework</span>
+            <span><i className="legend-dot" style={{ background: "#e0607c" }} /> Negative end</span>
+            <span><i className="legend-dot" style={{ background: "#34d399" }} /> Positive end</span>
+            <span style={{ marginLeft: "auto" }}>Edge thickness &amp; label = transition frequency · click a node to isolate its flows</span>
+          </div>
+          <ProcessMap analysis={analysis} selected={selectedNode} setSelected={setSelectedNode} />
+        </>
+      )}
+
+      {tab === "variants" && <VariantsView analysis={analysis} />}
+
+      {tab === "log" && <EventLogView cases={cases} />}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<ProcessMiningExplorer />);
+</script>
+
+<script>
+  // Manually transform with the classic JSX runtime so the output has no
+  // ES module "import" statements (which a plain <script> can't execute).
+  var source = document.getElementById("app-source").textContent;
+  var compiled = Babel.transform(source, {
+    presets: [["react", { runtime: "classic" }]],
+  }).code;
+  var scriptEl = document.createElement("script");
+  scriptEl.text = compiled;
+  document.body.appendChild(scriptEl);
+</script>
+</body>
+</html>
