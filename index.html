@@ -44,7 +44,7 @@ const weightedPick = (options) => {
 };
 const randRange = (min, max) => min + rand() * (max - min);
 
-const META = {
+const DEMO_META = {
   "Create Order": { level: 0, type: "start", resource: "Sales Team", dur: [0, 1] },
   "Check Credit": { level: 1, type: "normal", resource: "Credit Dept", dur: [1, 6] },
   "Check Stock": { level: 2, type: "normal", resource: "Warehouse", dur: [1, 4] },
@@ -110,8 +110,8 @@ function generateCase(caseId, startTime) {
   let guard = 0;
   while (current && guard < 25) {
     guard++;
-    const [min, max] = META[current].dur;
-    trace.push({ activity: current, timestamp: new Date(t), resource: META[current].resource });
+    const [min, max] = DEMO_META[current].dur;
+    trace.push({ activity: current, timestamp: new Date(t), resource: DEMO_META[current].resource });
     t += randRange(min, max) * 3600 * 1000;
 
     if (!TRANSITIONS[current] || TRANSITIONS[current].length === 0) break;
@@ -145,6 +145,174 @@ function buildLog() {
 }
 
 /* ---------------------------------------------------------------
+   GENERIC META — computed for any uploaded event log, since a
+   real log's activity names/levels/types aren't known up front
+--------------------------------------------------------------- */
+
+const NEGATIVE_KEYWORDS = ["reject", "cancel", "decline", "abort", "fail", "deny", "denied", "refuse", "withdraw", "void"];
+
+function computeGenericMeta(cases) {
+  const activities = new Set();
+  const isFirst = new Set();
+  const isLast = new Set();
+  const outgoing = {};
+
+  cases.forEach((c) => {
+    const acts = c.events.map((e) => e.activity);
+    acts.forEach((a) => activities.add(a));
+    if (acts.length) {
+      isFirst.add(acts[0]);
+      isLast.add(acts[acts.length - 1]);
+    }
+    for (let i = 0; i < acts.length - 1; i++) {
+      (outgoing[acts[i]] = outgoing[acts[i]] || new Set()).add(acts[i + 1]);
+    }
+  });
+
+  // multi-source BFS from start activities -> level = shortest distance from any start
+  const level = {};
+  const queue = [];
+  isFirst.forEach((a) => {
+    if (level[a] === undefined) {
+      level[a] = 0;
+      queue.push(a);
+    }
+  });
+  if (queue.length === 0 && activities.size > 0) {
+    const a0 = activities.values().next().value;
+    level[a0] = 0;
+    queue.push(a0);
+  }
+  let qi = 0;
+  while (qi < queue.length) {
+    const cur = queue[qi++];
+    const nexts = outgoing[cur];
+    if (!nexts) continue;
+    nexts.forEach((n) => {
+      if (level[n] === undefined) {
+        level[n] = level[cur] + 1;
+        queue.push(n);
+      }
+    });
+  }
+  const maxAssigned = Math.max(0, ...Object.values(level));
+  activities.forEach((a) => {
+    if (level[a] === undefined) level[a] = maxAssigned + 1;
+  });
+
+  // detect loop/rework participants: any edge a->b where b's level doesn't move forward
+  const backEdgeActivities = new Set();
+  cases.forEach((c) => {
+    const acts = c.events.map((e) => e.activity);
+    for (let i = 0; i < acts.length - 1; i++) {
+      const a = acts[i];
+      const b = acts[i + 1];
+      if (level[b] <= level[a]) {
+        backEdgeActivities.add(a);
+        backEdgeActivities.add(b);
+      }
+    }
+  });
+
+  const meta = {};
+  activities.forEach((a) => {
+    const first = isFirst.has(a);
+    const last = isLast.has(a);
+    let type;
+    if (last) {
+      const lower = a.toLowerCase();
+      const negative = NEGATIVE_KEYWORDS.some((kw) => lower.includes(kw));
+      type = negative ? "end-bad" : "end-good";
+    } else if (first) {
+      type = "start";
+    } else if (backEdgeActivities.has(a)) {
+      type = "exception";
+    } else {
+      type = "normal";
+    }
+    meta[a] = { level: level[a], type };
+  });
+  return meta;
+}
+
+/* ---------------------------------------------------------------
+   XES PARSING — for uploaded real event logs
+--------------------------------------------------------------- */
+
+const MAX_IMPORTED_CASES = 3000;
+
+function parseXES(xmlText) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlText, "application/xml");
+  if (doc.querySelector("parsererror")) {
+    throw new Error("This file doesn't look like valid XML/XES. Please check the file and try again.");
+  }
+
+  const traceEls = Array.from(doc.getElementsByTagName("trace"));
+  if (traceEls.length === 0) {
+    throw new Error("No <trace> elements found — this doesn't look like a valid XES event log.");
+  }
+
+  const ATTR_TAGS = new Set(["string", "date", "int", "float", "boolean", "id"]);
+  const getAttrs = (el) => {
+    const attrs = {};
+    for (const child of el.children) {
+      const tag = child.tagName.toLowerCase();
+      if (ATTR_TAGS.has(tag)) {
+        const key = child.getAttribute("key");
+        const value = child.getAttribute("value");
+        if (key) attrs[key] = value;
+      }
+    }
+    return attrs;
+  };
+
+  let cases = [];
+  traceEls.forEach((traceEl, idx) => {
+    const traceAttrs = getAttrs(traceEl);
+    const caseId = traceAttrs["concept:name"] || `Case ${idx + 1}`;
+    const eventEls = Array.from(traceEl.getElementsByTagName("event"));
+    let events = eventEls.map((evEl) => {
+      const a = getAttrs(evEl);
+      return {
+        activity: a["concept:name"] || "Unknown",
+        timestamp: a["time:timestamp"] ? new Date(a["time:timestamp"]) : null,
+        resource: a["org:resource"] || null,
+        lifecycle: a["lifecycle:transition"] || null,
+      };
+    });
+
+    // if lifecycle info is present, keep only "complete" events to avoid double-counting
+    // start/complete pairs of the same activity as separate directly-follows steps
+    const hasLifecycle = events.some((e) => e.lifecycle);
+    if (hasLifecycle) {
+      const completes = events.filter((e) => e.lifecycle && e.lifecycle.toLowerCase() === "complete");
+      if (completes.length > 0) events = completes;
+    }
+
+    events = events.filter((e) => e.timestamp && !Number.isNaN(e.timestamp.getTime()));
+    events.sort((a, b) => a.timestamp - b.timestamp);
+    events = events.map((e, i) => ({ ...e, index: i }));
+
+    if (events.length > 0) {
+      cases.push({ caseId: String(caseId), events });
+    }
+  });
+
+  if (cases.length === 0) {
+    throw new Error("No cases with valid timestamped events were found in this file.");
+  }
+
+  let truncated = false;
+  if (cases.length > MAX_IMPORTED_CASES) {
+    cases = cases.slice(0, MAX_IMPORTED_CASES);
+    truncated = true;
+  }
+
+  return { cases, truncated, totalCasesInFile: traceEls.length };
+}
+
+/* ---------------------------------------------------------------
    ANALYSIS HELPERS
 --------------------------------------------------------------- */
 
@@ -157,14 +325,15 @@ function fmtDur(hours) {
   return `${(hours / 24).toFixed(1)}d`;
 }
 
-function analyze(cases) {
+function analyze(cases, meta) {
   const events = cases.flatMap((c) => c.events);
   const nodeFreq = {};
   const edgeFreq = {};
   const nodeDurSamples = {};
   const edgeDurSamples = {};
   const durations = [];
-  const endActivity = { "Close Order": 0, "Reject Order": 0, "Cancel Order": 0, other: 0 };
+  let endGoodCount = 0;
+  let endBadCount = 0;
 
   cases.forEach((c) => {
     const acts = c.events.map((e) => e.activity);
@@ -180,8 +349,9 @@ function analyze(cases) {
     const last = c.events[c.events.length - 1].timestamp.getTime();
     durations.push((last - first) / (3600 * 1000));
     const last_act = acts[acts.length - 1];
-    if (endActivity[last_act] !== undefined) endActivity[last_act]++;
-    else endActivity.other++;
+    const lastType = meta[last_act] ? meta[last_act].type : null;
+    if (lastType === "end-good") endGoodCount++;
+    else if (lastType === "end-bad") endBadCount++;
   });
 
   const nodeAvgDur = {};
@@ -249,9 +419,8 @@ function analyze(cases) {
     avgEvents,
     totalEvents: events.length,
     totalCases: cases.length,
-    completionRate: (endActivity["Close Order"] / cases.length) * 100,
-    exceptionRate:
-      ((endActivity["Reject Order"] + endActivity["Cancel Order"]) / cases.length) * 100,
+    completionRate: (endGoodCount / cases.length) * 100,
+    exceptionRate: (endBadCount / cases.length) * 100,
   };
 }
 
@@ -259,43 +428,46 @@ function analyze(cases) {
    PROCESS MAP LAYOUT
 --------------------------------------------------------------- */
 
-const LEVEL_GROUPS = (() => {
-  const g = {};
-  Object.entries(META).forEach(([name, m]) => {
-    g[m.level] = g[m.level] || [];
-    g[m.level].push(name);
-  });
-  return g;
-})();
-const MAX_LEVEL = Math.max(...Object.values(META).map((m) => m.level));
-const MAX_PER_LEVEL = Math.max(...Object.values(LEVEL_GROUPS).map((a) => a.length));
-
 const NODE_W = 138;
 const NODE_H = 54;
 const COL_GAP = 168;
 const ROW_GAP = 118;
-const CANVAS_H = MAX_PER_LEVEL * ROW_GAP + 160;
-const CANVAS_W = (MAX_LEVEL + 1) * COL_GAP + 80;
 
-function computeViewBox(visibleNodes) {
-  if (!visibleNodes) return { x: 0, y: 0, w: CANVAS_W, h: CANVAS_H };
-  const levels = [...visibleNodes].map((n) => META[n].level);
-  const minL = Math.min(...levels);
-  const maxL = Math.max(...levels);
-  const x = 70 + minL * COL_GAP - 60;
-  const w = (maxL - minL) * COL_GAP + NODE_W + 130;
-  return { x, y: 0, w, h: CANVAS_H };
-}
+function computeLayout(meta) {
+  const levelGroups = {};
+  Object.entries(meta).forEach(([name, m]) => {
+    levelGroups[m.level] = levelGroups[m.level] || [];
+    levelGroups[m.level].push(name);
+  });
+  const levels = Object.keys(levelGroups).map(Number);
+  const maxLevel = levels.length ? Math.max(...levels) : 0;
+  const maxPerLevel = Math.max(1, ...Object.values(levelGroups).map((a) => a.length));
+  const canvasH = maxPerLevel * ROW_GAP + 160;
+  const canvasW = (maxLevel + 1) * COL_GAP + 80;
 
-function nodePos(name) {
-  const m = META[name];
-  const group = LEVEL_GROUPS[m.level];
-  const idx = group.indexOf(name);
-  const n = group.length;
-  const x = 70 + m.level * COL_GAP;
-  const centerY = CANVAS_H / 2;
-  const y = centerY - ((n - 1) * ROW_GAP) / 2 + idx * ROW_GAP;
-  return { x, y };
+  const nodePos = (name) => {
+    const m = meta[name];
+    if (!m) return { x: 70, y: canvasH / 2 };
+    const group = levelGroups[m.level];
+    const idx = group.indexOf(name);
+    const n = group.length;
+    const x = 70 + m.level * COL_GAP;
+    const centerY = canvasH / 2;
+    const y = centerY - ((n - 1) * ROW_GAP) / 2 + idx * ROW_GAP;
+    return { x, y };
+  };
+
+  const computeViewBox = (visibleNodes) => {
+    if (!visibleNodes) return { x: 0, y: 0, w: canvasW, h: canvasH };
+    const lvls = [...visibleNodes].map((n) => (meta[n] ? meta[n].level : 0));
+    const minL = Math.min(...lvls);
+    const maxL = Math.max(...lvls);
+    const x = 70 + minL * COL_GAP - 60;
+    const w = (maxL - minL) * COL_GAP + NODE_W + 130;
+    return { x, y: 0, w, h: canvasH };
+  };
+
+  return { levelGroups, maxLevel, maxPerLevel, canvasW, canvasH, nodePos, computeViewBox };
 }
 
 const TYPE_COLOR = {
@@ -328,11 +500,11 @@ function metricColor(ratio) {
   return `rgb(${r}, ${g}, ${bl})`;
 }
 
-function edgePathAndLabel(a, b, value, maxValue) {
-  const p1 = nodePos(a);
-  const p2 = nodePos(b);
+function edgePathAndLabel(a, b, value, maxValue, meta, layout) {
+  const p1 = layout.nodePos(a);
+  const p2 = layout.nodePos(b);
   const isSelf = a === b;
-  const forward = META[b].level > META[a].level;
+  const forward = meta[b].level > meta[a].level;
   const x1 = p1.x + NODE_W;
   const y1 = p1.y;
   const x2 = p2.x;
@@ -351,7 +523,7 @@ function edgePathAndLabel(a, b, value, maxValue) {
     return { d, strokeW, ratio, labelX: midX, labelY: (y1 + y2) / 2 };
   }
   // backward / same-level loop edge — arc below
-  const bulge = 90 + Math.abs(META[a].level - META[b].level) * 4;
+  const bulge = 90 + Math.abs(meta[a].level - meta[b].level) * 4;
   const sx = p1.x + NODE_W / 2;
   const sy = p1.y + NODE_H / 2;
   const tx = p2.x + NODE_W / 2;
@@ -412,6 +584,8 @@ function PlayToggle({ animate, setAnimate }) {
 }
 
 function ProcessMap({
+  meta,
+  layout,
   nodeFreq,
   edgeFreq,
   nodeAvgDur,
@@ -423,7 +597,7 @@ function ProcessMap({
   visibleEdges,
   animate = false,
 }) {
-  const nodeNames = visibleNodes ? Object.keys(META).filter((n) => visibleNodes.has(n)) : Object.keys(META);
+  const nodeNames = visibleNodes ? Object.keys(meta).filter((n) => visibleNodes.has(n)) : Object.keys(meta);
   const edgeEntries = visibleEdges
     ? Object.entries(edgeFreq).filter(([k]) => visibleEdges.has(k))
     : Object.entries(edgeFreq);
@@ -446,7 +620,7 @@ function ProcessMap({
     return s;
   };
   const rel = relatedEdges(selected);
-  const vb = computeViewBox(visibleNodes);
+  const vb = layout.computeViewBox(visibleNodes);
 
   return (
     <div className="map-scroll">
@@ -463,7 +637,7 @@ function ProcessMap({
         {edgeEntries.map(([key, freqWeight]) => {
           const [a, b] = key.split("→");
           const value = metric === "count" ? freqWeight : edgeAvgDur[key];
-          const { d, strokeW, ratio, labelX, labelY } = edgePathAndLabel(a, b, value || 0, maxEdgeVal);
+          const { d, strokeW, ratio, labelX, labelY } = edgePathAndLabel(a, b, value || 0, maxEdgeVal, meta, layout);
           const label = metric === "count" ? String(freqWeight) : fmtDur(edgeAvgDur[key]);
           const dim = rel && !rel.has(key);
           const strokeColor = dim ? "var(--edge-dim)" : metric === "count" ? "var(--amber)" : metricColor(ratio);
@@ -504,8 +678,8 @@ function ProcessMap({
         })}
 
         {nodeNames.map((name) => {
-          const { x, y } = nodePos(name);
-          const colors = TYPE_COLOR[META[name].type];
+          const { x, y } = layout.nodePos(name);
+          const colors = TYPE_COLOR[meta[name].type];
           const freq = nodeFreq[name] || 0;
           const isSel = selected === name;
           const dim = selected && !isSel && rel && !rel.has(name);
@@ -545,7 +719,7 @@ function ProcessMap({
   );
 }
 
-function VariantsView({ analysis, mapMetric, setMapMetric, animate, setAnimate }) {
+function VariantsView({ analysis, meta, layout, mapMetric, setMapMetric, animate, setAnimate }) {
   const [expanded, setExpanded] = useState(null);
   const max = analysis.variants[0].count;
   return (
@@ -579,13 +753,15 @@ function VariantsView({ analysis, mapMetric, setMapMetric, animate, setAnimate }
                 <div className="variant-trace">
                   {v.steps.map((s, j) => (
                     <React.Fragment key={j}>
-                      <span className={`trace-chip type-${META[s].type}`}>{s}</span>
+                      <span className={`trace-chip type-${meta[s].type}`}>{s}</span>
                       {j < v.steps.length - 1 && <span className="trace-arrow">→</span>}
                     </React.Fragment>
                   ))}
                 </div>
                 <div className="variant-map">
                   <ProcessMap
+                    meta={meta}
+                    layout={layout}
                     nodeFreq={v.nodeFreq}
                     edgeFreq={v.edgeFreq}
                     nodeAvgDur={v.nodeAvgDur}
@@ -607,7 +783,7 @@ function VariantsView({ analysis, mapMetric, setMapMetric, animate, setAnimate }
   );
 }
 
-function EventLogView({ cases }) {
+function EventLogView({ cases, meta }) {
   const [query, setQuery] = useState("");
   const filtered = useMemo(() => {
     if (!query.trim()) return cases;
@@ -663,7 +839,7 @@ function EventLogView({ cases }) {
                   <td className="mono">{c.caseId}</td>
                   <td className="mono dim">{e.index + 1}</td>
                   <td>
-                    <span className={`trace-chip small type-${META[e.activity].type}`}>{e.activity}</span>
+                    <span className={`trace-chip small type-${meta[e.activity].type}`}>{e.activity}</span>
                   </td>
                   <td className="mono dim">
                     {e.timestamp.toLocaleString(undefined, {
@@ -687,14 +863,14 @@ function EventLogView({ cases }) {
   );
 }
 
-function ActivityFrequency({ analysis }) {
+function ActivityFrequency({ analysis, meta }) {
   const entries = Object.entries(analysis.nodeFreq).sort((a, b) => b[1] - a[1]);
   const max = entries[0][1];
   return (
     <div className="freq-list">
       {entries.map(([name, count]) => (
         <div className="freq-row" key={name}>
-          <span className={`freq-name type-${META[name].type}`}>{name}</span>
+          <span className={`freq-name type-${meta[name].type}`}>{name}</span>
           <div className="freq-track">
             <div className="freq-fill" style={{ width: `${(count / max) * 100}%` }} />
           </div>
@@ -734,7 +910,7 @@ function ActivityFilterBar({ allActivities, activityFilter, toggleActivity, clea
   );
 }
 
-function CaseViewerView({ cases, analysis }) {
+function CaseViewerView({ cases, analysis, meta }) {
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(cases[0] ? cases[0].caseId : null);
 
@@ -799,7 +975,7 @@ function CaseViewerView({ cases, analysis }) {
 
         <div className="case-timeline">
           {events.map((e, i) => {
-            const colors = TYPE_COLOR[META[e.activity].type];
+            const colors = TYPE_COLOR[meta[e.activity].type];
             const next = events[i + 1];
             const gapH = next ? (next.timestamp.getTime() - e.timestamp.getTime()) / (3600 * 1000) : null;
             return (
@@ -831,12 +1007,42 @@ function CaseViewerView({ cases, analysis }) {
   );
 }
 
+function DataSourceBar({ dataSource, fileName, caseCount, warning, error, onFileSelect, onLoadDemo, loading }) {
+  return (
+    <div className="datasource-bar">
+      <div className="datasource-info">
+        <span className="filter-bar-label">Data source:</span>
+        {dataSource === "demo" ? (
+          <span className="datasource-label">Demo data · 100 simulated orders</span>
+        ) : (
+          <span className="datasource-label">
+            {fileName} · {caseCount} case(s)
+          </span>
+        )}
+      </div>
+      <div className="datasource-actions">
+        <label className="file-btn">
+          {loading ? "Parsing…" : "📁 Upload .xes file"}
+          <input type="file" accept=".xes,.xml" onChange={onFileSelect} style={{ display: "none" }} disabled={loading} />
+        </label>
+        {dataSource !== "demo" && (
+          <button className="ghost-btn" onClick={onLoadDemo}>
+            ↺ Load demo data
+          </button>
+        )}
+      </div>
+      {warning && <div className="datasource-warning">⚠ {warning}</div>}
+      {error && <div className="datasource-error">✕ {error}</div>}
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------
    ROOT
 --------------------------------------------------------------- */
 
 function ProcessMiningExplorer() {
-  const cases = useMemo(() => buildLog(), []);
+  const demoCases = useMemo(() => buildLog(), []);
   const [tab, setTab] = useState("overview");
   const [selectedNode, setSelectedNode] = useState(null);
   const [mapMetric, setMapMetric] = useState("count");
@@ -844,7 +1050,68 @@ function ProcessMiningExplorer() {
   const [animate, setAnimate] = useState(true);
   const [activityFilter, setActivityFilter] = useState(() => new Set());
 
-  const allActivities = Object.keys(META);
+  const [dataSource, setDataSource] = useState("demo"); // 'demo' | 'custom'
+  const [customCases, setCustomCases] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const [xesWarning, setXesWarning] = useState(null);
+  const [xesError, setXesError] = useState(null);
+  const [xesLoading, setXesLoading] = useState(false);
+
+  const cases = dataSource === "custom" && customCases ? customCases : demoCases;
+
+  const activeMeta = useMemo(() => {
+    return dataSource === "custom" && customCases ? computeGenericMeta(customCases) : DEMO_META;
+  }, [dataSource, customCases]);
+
+  const layout = useMemo(() => computeLayout(activeMeta), [activeMeta]);
+
+  const allActivities = Object.keys(activeMeta);
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setXesLoading(true);
+    setXesError(null);
+    setXesWarning(null);
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const { cases: parsed, truncated, totalCasesInFile } = parseXES(evt.target.result);
+        setCustomCases(parsed);
+        setFileName(file.name);
+        setDataSource("custom");
+        setActivityFilter(new Set());
+        setSelectedNode(null);
+        setTab("overview");
+        if (truncated) {
+          setXesWarning(
+            `This log has ${totalCasesInFile} cases — showing the first ${MAX_IMPORTED_CASES} for performance.`
+          );
+        }
+      } catch (err) {
+        setXesError(err.message || "Couldn't parse this file.");
+      } finally {
+        setXesLoading(false);
+      }
+    };
+    reader.onerror = () => {
+      setXesError("Couldn't read this file.");
+      setXesLoading(false);
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // allow re-selecting the same file later
+  };
+
+  const handleLoadDemo = () => {
+    setDataSource("demo");
+    setCustomCases(null);
+    setFileName(null);
+    setXesWarning(null);
+    setXesError(null);
+    setActivityFilter(new Set());
+    setSelectedNode(null);
+    setTab("overview");
+  };
 
   const toggleActivity = (name) => {
     setActivityFilter((prev) => {
@@ -864,7 +1131,7 @@ function ProcessMiningExplorer() {
     });
   }, [cases, activityFilter]);
 
-  const analysis = useMemo(() => analyze(filteredCases), [filteredCases]);
+  const analysis = useMemo(() => analyze(filteredCases, activeMeta), [filteredCases, activeMeta]);
 
   const tabs = [
     { id: "overview", label: "Overview" },
@@ -874,10 +1141,24 @@ function ProcessMiningExplorer() {
     { id: "log", label: "Event Log" },
   ];
 
+  const dataSourceBar = (
+    <DataSourceBar
+      dataSource={dataSource}
+      fileName={fileName}
+      caseCount={cases.length}
+      warning={xesWarning}
+      error={xesError}
+      onFileSelect={handleFileSelect}
+      onLoadDemo={handleLoadDemo}
+      loading={xesLoading}
+    />
+  );
+
   if (filteredCases.length === 0) {
     return (
       <div className={`pm-root theme-${theme}`}>
         <style>{`.pm-root.theme-${theme} { background: ${theme === "dark" ? "#0b1220" : "#f4f6fb"}; color: ${theme === "dark" ? "#e6edf5" : "#17202e"}; min-height: 100vh; padding: 40px; font-family: system-ui, sans-serif; }`}</style>
+        {dataSourceBar}
         <p>No cases match the selected activity filters.</p>
         <button className="filter-clear" onClick={clearFilter} style={{ color: theme === "dark" ? "#f5c977" : "#9c5e0a" }}>
           Clear filters
@@ -1073,13 +1354,26 @@ function ProcessMiningExplorer() {
         .tl-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
         .tl-gap { margin-left: 6px; padding-left: 24px; border-left: 1px dashed var(--border); font-size: 11px; color: var(--muted); font-family: var(--mono); padding-top: 4px; padding-bottom: 4px; }
         .empty-state { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; }
+
+        .datasource-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; position: relative; }
+        .datasource-info { display: flex; align-items: center; gap: 8px; }
+        .datasource-label { font-family: var(--mono); font-size: 12px; color: var(--text); }
+        .datasource-actions { display: flex; gap: 10px; margin-left: auto; }
+        .file-btn { font-family: var(--body); font-weight: 600; font-size: 12.5px; padding: 8px 14px; border-radius: 9px; cursor: pointer; color: var(--amber-soft); border: 1px solid var(--amber); background: var(--panel-2); }
+        .file-btn:hover { background: var(--panel); }
+        .datasource-warning { flex-basis: 100%; font-size: 12px; color: var(--amber-soft); font-family: var(--mono); }
+        .datasource-error { flex-basis: 100%; font-size: 12px; color: var(--red); font-family: var(--mono); }
       `}</style>
 
       <div className="pm-header">
         <div className="pm-title-block">
-          <div className="eyebrow">Process Mining · Order-to-Cash</div>
-          <h1>Order Fulfillment Process Explorer</h1>
-          <p>100 simulated orders replayed as an event log — directly-follows graph, variant breakdown, and raw trace inspection.</p>
+          <div className="eyebrow">Process Mining{dataSource === "custom" ? " · Custom Log" : " · Order-to-Cash"}</div>
+          <h1>{dataSource === "custom" ? "Event Log Explorer" : "Order Fulfillment Process Explorer"}</h1>
+          <p>
+            {dataSource === "custom"
+              ? `${fileName} replayed as an event log — directly-follows graph, variant breakdown, and raw trace inspection.`
+              : "100 simulated orders replayed as an event log — directly-follows graph, variant breakdown, and raw trace inspection."}
+          </p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 22 }}>
           <div className="pm-header-stats">
@@ -1099,6 +1393,8 @@ function ProcessMiningExplorer() {
         ))}
       </div>
 
+      {dataSourceBar}
+
       <ActivityFilterBar
         allActivities={allActivities}
         activityFilter={activityFilter}
@@ -1111,8 +1407,8 @@ function ProcessMiningExplorer() {
       {tab === "overview" && (
         <>
           <div className="kpi-grid">
-            <KpiCard label="Completion rate" value={`${analysis.completionRate.toFixed(0)}%`} sub="reached Close Order" accent="var(--green)" />
-            <KpiCard label="Exception rate" value={`${analysis.exceptionRate.toFixed(0)}%`} sub="rejected or cancelled" accent="var(--red)" />
+            <KpiCard label="Completion rate" value={`${analysis.completionRate.toFixed(0)}%`} sub="reached a positive end" accent="var(--green)" />
+            <KpiCard label="Exception rate" value={`${analysis.exceptionRate.toFixed(0)}%`} sub="reached a negative end" accent="var(--red)" />
             <KpiCard label="Avg case duration" value={`${(analysis.avgDuration / 24).toFixed(1)}d`} sub={`${analysis.avgDuration.toFixed(0)} hours`} />
             <KpiCard label="Avg events / case" value={analysis.avgEvents.toFixed(1)} sub="activity steps" />
             <KpiCard label="Top variant share" value={`${((analysis.variants[0].count / analysis.totalCases) * 100).toFixed(0)}%`} sub={`${analysis.variants[0].count} of ${analysis.totalCases} cases`} accent="var(--amber-soft)" />
@@ -1124,7 +1420,7 @@ function ProcessMiningExplorer() {
               <div className="variant-trace" style={{ borderTop: "none", paddingTop: 0 }}>
                 {analysis.variants[0].steps.map((s, j) => (
                   <React.Fragment key={j}>
-                    <span className={`trace-chip type-${META[s].type}`}>{s}</span>
+                    <span className={`trace-chip type-${activeMeta[s].type}`}>{s}</span>
                     {j < analysis.variants[0].steps.length - 1 && <span className="trace-arrow">→</span>}
                   </React.Fragment>
                 ))}
@@ -1133,7 +1429,7 @@ function ProcessMiningExplorer() {
             <div className="panel">
               <h3>Activity frequency</h3>
               <p className="panel-sub">Instances per activity across all cases</p>
-              <ActivityFrequency analysis={analysis} />
+              <ActivityFrequency analysis={analysis} meta={activeMeta} />
             </div>
           </div>
         </>
@@ -1159,6 +1455,8 @@ function ProcessMiningExplorer() {
             <MetricToggle metric={mapMetric} setMetric={setMapMetric} />
           </div>
           <ProcessMap
+            meta={activeMeta}
+            layout={layout}
             nodeFreq={analysis.nodeFreq}
             edgeFreq={analysis.edgeFreq}
             nodeAvgDur={analysis.nodeAvgDur}
@@ -1172,12 +1470,20 @@ function ProcessMiningExplorer() {
       )}
 
       {tab === "variants" && (
-        <VariantsView analysis={analysis} mapMetric={mapMetric} setMapMetric={setMapMetric} animate={animate} setAnimate={setAnimate} />
+        <VariantsView
+          analysis={analysis}
+          meta={activeMeta}
+          layout={layout}
+          mapMetric={mapMetric}
+          setMapMetric={setMapMetric}
+          animate={animate}
+          setAnimate={setAnimate}
+        />
       )}
 
-      {tab === "cases" && <CaseViewerView cases={filteredCases} analysis={analysis} />}
+      {tab === "cases" && <CaseViewerView cases={filteredCases} analysis={analysis} meta={activeMeta} />}
 
-      {tab === "log" && <EventLogView cases={filteredCases} />}
+      {tab === "log" && <EventLogView cases={filteredCases} meta={activeMeta} />}
     </div>
   );
 }
