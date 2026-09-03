@@ -139,7 +139,7 @@ function buildLog() {
     const caseId = `ORD-${1000 + i}`;
     const startOffsetDays = randRange(1, 55);
     const start = now.getTime() - startOffsetDays * 24 * 3600 * 1000;
-    cases.push({ caseId, events: generateCase(caseId, start) });
+    cases.push({ caseId, events: generateCase(caseId, start), attributes: {}, attributeTypes: {} });
   }
   return cases;
 }
@@ -254,31 +254,49 @@ function parseXES(xmlText) {
   }
 
   const ATTR_TAGS = new Set(["string", "date", "int", "float", "boolean", "id"]);
+  const KNOWN_EVENT_KEYS = new Set(["concept:name", "time:timestamp", "org:resource", "lifecycle:transition"]);
   const getAttrs = (el) => {
     const attrs = {};
+    const types = {};
     for (const child of el.children) {
       const tag = child.tagName.toLowerCase();
       if (ATTR_TAGS.has(tag)) {
         const key = child.getAttribute("key");
         const value = child.getAttribute("value");
-        if (key) attrs[key] = value;
+        if (key) {
+          attrs[key] = value;
+          types[key] = tag;
+        }
       }
     }
-    return attrs;
+    return { attrs, types };
   };
 
   let cases = [];
   traceEls.forEach((traceEl, idx) => {
-    const traceAttrs = getAttrs(traceEl);
+    const { attrs: traceAttrs, types: traceTypes } = getAttrs(traceEl);
     const caseId = traceAttrs["concept:name"] || `Case ${idx + 1}`;
+    const attributes = {};
+    const attributeTypes = {};
+    Object.keys(traceAttrs).forEach((k) => {
+      if (k === "concept:name") return;
+      attributes[k] = traceAttrs[k];
+      attributeTypes[k] = traceTypes[k];
+    });
+
     const eventEls = Array.from(traceEl.getElementsByTagName("event"));
     let events = eventEls.map((evEl) => {
-      const a = getAttrs(evEl);
+      const { attrs: a } = getAttrs(evEl);
+      const extra = {};
+      Object.keys(a).forEach((k) => {
+        if (!KNOWN_EVENT_KEYS.has(k)) extra[k] = a[k];
+      });
       return {
         activity: a["concept:name"] || "Unknown",
         timestamp: a["time:timestamp"] ? new Date(a["time:timestamp"]) : null,
         resource: a["org:resource"] || null,
         lifecycle: a["lifecycle:transition"] || null,
+        attributes: extra,
       };
     });
 
@@ -295,7 +313,7 @@ function parseXES(xmlText) {
     events = events.map((e, i) => ({ ...e, index: i }));
 
     if (events.length > 0) {
-      cases.push({ caseId: String(caseId), events });
+      cases.push({ caseId: String(caseId), events, attributes, attributeTypes });
     }
   });
 
@@ -311,6 +329,67 @@ function parseXES(xmlText) {
 
   return { cases, truncated, totalCasesInFile: traceEls.length };
 }
+
+/* ---------------------------------------------------------------
+   CASE ATTRIBUTE FILTERING — surfaces XES case-level attributes
+   (e.g. RequestedAmount, OrganizationalEntity) as filter controls
+--------------------------------------------------------------- */
+
+const MAX_CATEGORICAL_VALUES = 20;
+
+function computeCaseAttributeDefs(cases) {
+  const keys = new Set();
+  cases.forEach((c) => Object.keys(c.attributes || {}).forEach((k) => keys.add(k)));
+
+  const defs = [];
+  keys.forEach((key) => {
+    const samples = cases.filter((c) => c.attributes && c.attributes[key] !== undefined);
+    if (samples.length === 0) return;
+
+    const declaredType = samples[0].attributeTypes && samples[0].attributeTypes[key];
+    const isNumericType = declaredType === "int" || declaredType === "float";
+    const values = samples.map((c) => c.attributes[key]);
+    const numericValues = values.map((v) => parseFloat(v)).filter((v) => !Number.isNaN(v));
+    const looksNumeric = isNumericType || (numericValues.length === values.length && values.length > 0);
+
+    if (looksNumeric && numericValues.length > 0) {
+      defs.push({
+        key,
+        kind: "numeric",
+        min: Math.min(...numericValues),
+        max: Math.max(...numericValues),
+      });
+    } else {
+      const distinct = [...new Set(values)];
+      if (distinct.length <= MAX_CATEGORICAL_VALUES && distinct.length > 1) {
+        defs.push({ key, kind: "categorical", options: distinct.sort() });
+      }
+      // if >MAX_CATEGORICAL_VALUES distinct values, skip building a filter control —
+      // still shown informationally in the Case Viewer
+    }
+  });
+
+  return defs.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function caseMatchesAttrFilters(c, defs, filters) {
+  for (const def of defs) {
+    const spec = filters[def.key];
+    if (!spec) continue;
+    const raw = c.attributes ? c.attributes[def.key] : undefined;
+    if (raw === undefined) continue; // don't exclude cases missing the attribute
+    if (def.kind === "numeric") {
+      const v = parseFloat(raw);
+      if (Number.isNaN(v)) continue;
+      if (spec.min !== undefined && v < spec.min) return false;
+      if (spec.max !== undefined && v > spec.max) return false;
+    } else if (def.kind === "categorical") {
+      if (spec.selected && spec.selected.size > 0 && !spec.selected.has(raw)) return false;
+    }
+  }
+  return true;
+}
+
 
 /* ---------------------------------------------------------------
    ANALYSIS HELPERS
@@ -935,6 +1014,81 @@ function ActivityFilterBar({ allActivities, activityFilter, toggleActivity, clea
   );
 }
 
+function CaseAttributeFilterBar({ defs, filters, setFilters, hasActiveFilter, clearAll }) {
+  if (defs.length === 0) return null;
+
+  const setNumeric = (key, which, value) => {
+    setFilters((prev) => {
+      const current = prev[key] || {};
+      const next = { ...current, [which]: value === "" ? undefined : Number(value) };
+      return { ...prev, [key]: next };
+    });
+  };
+
+  const toggleCategorical = (key, option) => {
+    setFilters((prev) => {
+      const current = prev[key] || { selected: new Set() };
+      const nextSelected = new Set(current.selected);
+      if (nextSelected.has(option)) nextSelected.delete(option);
+      else nextSelected.add(option);
+      return { ...prev, [key]: { selected: nextSelected } };
+    });
+  };
+
+  return (
+    <div className="filter-bar attr-filter-bar">
+      <span className="filter-bar-label">Case attributes:</span>
+      {defs.map((def) => {
+        if (def.kind === "numeric") {
+          const spec = filters[def.key] || {};
+          return (
+            <div className="attr-numeric" key={def.key}>
+              <span className="attr-name">{def.key}</span>
+              <input
+                type="number"
+                className="attr-num-input"
+                placeholder={def.min.toString()}
+                value={spec.min ?? ""}
+                onChange={(e) => setNumeric(def.key, "min", e.target.value)}
+              />
+              <span className="dim">–</span>
+              <input
+                type="number"
+                className="attr-num-input"
+                placeholder={def.max.toString()}
+                value={spec.max ?? ""}
+                onChange={(e) => setNumeric(def.key, "max", e.target.value)}
+              />
+            </div>
+          );
+        }
+        const spec = filters[def.key] || { selected: new Set() };
+        return (
+          <div className="attr-categorical" key={def.key}>
+            <span className="attr-name">{def.key}:</span>
+            {def.options.map((opt) => (
+              <button
+                key={opt}
+                className={`filter-chip small ${spec.selected.has(opt) ? "active" : ""}`}
+                onClick={() => toggleCategorical(def.key, opt)}
+              >
+                {opt}
+              </button>
+            ))}
+          </div>
+        );
+      })}
+      {hasActiveFilter && (
+        <span className="filter-summary">
+          <button className="filter-clear" onClick={clearAll}>
+            Clear attribute filters
+          </button>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function CaseViewerView({ cases, analysis, meta }) {
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(cases[0] ? cases[0].caseId : null);
@@ -998,11 +1152,22 @@ function CaseViewerView({ cases, analysis, meta }) {
           </div>
         </div>
 
+        {selectedCase.attributes && Object.keys(selectedCase.attributes).length > 0 && (
+          <div className="case-attrs-panel">
+            {Object.entries(selectedCase.attributes).map(([k, v]) => (
+              <span className="case-attr-pill" key={k}>
+                <span className="dim">{k}:</span> {v}
+              </span>
+            ))}
+          </div>
+        )}
+
         <div className="case-timeline">
           {events.map((e, i) => {
             const colors = TYPE_COLOR[meta[e.activity].type];
             const next = events[i + 1];
             const gapH = next ? (next.timestamp.getTime() - e.timestamp.getTime()) / (3600 * 1000) : null;
+            const extraAttrs = e.attributes ? Object.entries(e.attributes) : [];
             return (
               <React.Fragment key={i}>
                 <div className="tl-row">
@@ -1020,6 +1185,11 @@ function CaseViewerView({ cases, analysis, meta }) {
                       })}{" "}
                       · {e.resource}
                     </div>
+                    {extraAttrs.length > 0 && (
+                      <div className="tl-attrs">
+                        {extraAttrs.map(([k, v]) => `${k}: ${v}`).join(" · ")}
+                      </div>
+                    )}
                   </div>
                 </div>
                 {gapH !== null && <div className="tl-gap">↓ {fmtDur(gapH)} later</div>}
@@ -1075,6 +1245,7 @@ function ProcessMiningExplorer() {
   const [theme, setTheme] = useState("dark");
   const [animate, setAnimate] = useState(true);
   const [activityFilter, setActivityFilter] = useState(() => new Set());
+  const [caseAttrFilters, setCaseAttrFilters] = useState({});
 
   const [dataSource, setDataSource] = useState("demo"); // 'demo' | 'custom'
   const [customCases, setCustomCases] = useState(null);
@@ -1107,6 +1278,7 @@ function ProcessMiningExplorer() {
         setFileName(file.name);
         setDataSource("custom");
         setActivityFilter(new Set());
+        setCaseAttrFilters({});
         setSelectedNode(null);
         setTab("overview");
         if (truncated) {
@@ -1135,6 +1307,7 @@ function ProcessMiningExplorer() {
     setXesWarning(null);
     setXesError(null);
     setActivityFilter(new Set());
+    setCaseAttrFilters({});
     setSelectedNode(null);
     setTab("overview");
   };
@@ -1148,14 +1321,26 @@ function ProcessMiningExplorer() {
     });
   };
   const clearFilter = () => setActivityFilter(new Set());
+  const clearCaseAttrFilters = () => setCaseAttrFilters({});
+
+  const caseAttributeDefs = useMemo(() => computeCaseAttributeDefs(cases), [cases]);
+  const hasActiveAttrFilter = Object.values(caseAttrFilters).some(
+    (spec) => spec && ((spec.min !== undefined || spec.max !== undefined) || (spec.selected && spec.selected.size > 0))
+  );
 
   const filteredCases = useMemo(() => {
-    if (activityFilter.size === 0) return cases;
-    return cases.filter((c) => {
-      const acts = new Set(c.events.map((e) => e.activity));
-      return [...activityFilter].every((a) => acts.has(a));
-    });
-  }, [cases, activityFilter]);
+    let result = cases;
+    if (activityFilter.size > 0) {
+      result = result.filter((c) => {
+        const acts = new Set(c.events.map((e) => e.activity));
+        return [...activityFilter].every((a) => acts.has(a));
+      });
+    }
+    if (hasActiveAttrFilter) {
+      result = result.filter((c) => caseMatchesAttrFilters(c, caseAttributeDefs, caseAttrFilters));
+    }
+    return result;
+  }, [cases, activityFilter, caseAttrFilters, caseAttributeDefs, hasActiveAttrFilter]);
 
   const analysis = useMemo(() => analyze(filteredCases, activeMeta), [filteredCases, activeMeta]);
 
@@ -1170,8 +1355,26 @@ function ProcessMiningExplorer() {
 
   const mapVisibleNodes = useMemo(() => {
     if (!isDetailCustom) return null;
-    return new Set(activityRank.slice(0, effectiveDetailLevel));
-  }, [activityRank, effectiveDetailLevel, isDetailCustom]);
+    // At the minimum (1), honor the literal "single most frequent activity" spec.
+    if (effectiveDetailLevel <= 1) return new Set(activityRank.slice(0, 1));
+
+    // Otherwise, anchor the view on the most frequent start and end activity
+    // (if any exist) so the map never looks "headless" at low detail levels,
+    // then fill remaining slots by frequency rank.
+    const startCandidate = activityRank.find((a) => activeMeta[a] && activeMeta[a].type === "start");
+    const endCandidate = activityRank.find(
+      (a) => activeMeta[a] && (activeMeta[a].type === "end-good" || activeMeta[a].type === "end-bad")
+    );
+    const visible = new Set();
+    [startCandidate, endCandidate].forEach((a) => {
+      if (a && visible.size < effectiveDetailLevel) visible.add(a);
+    });
+    for (const a of activityRank) {
+      if (visible.size >= effectiveDetailLevel) break;
+      visible.add(a);
+    }
+    return visible;
+  }, [activityRank, effectiveDetailLevel, isDetailCustom, activeMeta]);
 
   const mapVisibleEdges = useMemo(() => {
     if (!mapVisibleNodes) return null;
@@ -1218,8 +1421,15 @@ function ProcessMiningExplorer() {
       <div className={`pm-root theme-${theme}`}>
         <style>{`.pm-root.theme-${theme} { background: ${theme === "dark" ? "#0b1220" : "#f4f6fb"}; color: ${theme === "dark" ? "#e6edf5" : "#17202e"}; min-height: 100vh; padding: 40px; font-family: system-ui, sans-serif; }`}</style>
         {dataSourceBar}
-        <p>No cases match the selected activity filters.</p>
-        <button className="filter-clear" onClick={clearFilter} style={{ color: theme === "dark" ? "#f5c977" : "#9c5e0a" }}>
+        <p>No cases match the selected filters.</p>
+        <button
+          className="filter-clear"
+          onClick={() => {
+            clearFilter();
+            clearCaseAttrFilters();
+          }}
+          style={{ color: theme === "dark" ? "#f5c977" : "#9c5e0a" }}
+        >
           Clear filters
         </button>
       </div>
@@ -1383,6 +1593,14 @@ function ProcessMiningExplorer() {
         .filter-clear { font-family: var(--body); font-size: 11.5px; font-weight: 600; color: var(--red); background: transparent; border: none; cursor: pointer; padding: 0; }
         .filter-clear:hover { text-decoration: underline; }
 
+        .attr-filter-bar { row-gap: 10px; }
+        .attr-numeric { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; }
+        .attr-name { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+        .attr-num-input { width: 76px; background: transparent; border: none; color: var(--text); font-family: var(--mono); font-size: 11.5px; outline: none; text-align: center; }
+        .attr-num-input:focus { color: var(--amber-soft); }
+        .attr-categorical { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .filter-chip.small { padding: 3px 9px; font-size: 11px; }
+
         .play-toggle { display: inline-flex; align-items: center; gap: 7px; font-family: var(--body); font-weight: 600; font-size: 12px; padding: 8px 14px; border-radius: 9px; cursor: pointer; color: var(--muted); border: 1px solid var(--border); background: var(--panel-2); transition: all 0.15s ease; }
         .play-toggle:hover { color: var(--text); }
         .play-toggle.on { color: var(--amber-soft); border-color: var(--amber); }
@@ -1416,6 +1634,9 @@ function ProcessMiningExplorer() {
         .tl-activity { font-size: 13.5px; font-weight: 600; }
         .tl-meta { font-size: 11.5px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
         .tl-gap { margin-left: 6px; padding-left: 24px; border-left: 1px dashed var(--border); font-size: 11px; color: var(--muted); font-family: var(--mono); padding-top: 4px; padding-bottom: 4px; }
+        .tl-attrs { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 3px; }
+        .case-attrs-panel { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+        .case-attr-pill { font-size: 11.5px; font-family: var(--mono); background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 5px 11px; }
         .empty-state { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; }
 
         .datasource-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; position: relative; }
@@ -1465,6 +1686,14 @@ function ProcessMiningExplorer() {
         clearFilter={clearFilter}
         matchCount={filteredCases.length}
         totalCount={cases.length}
+      />
+
+      <CaseAttributeFilterBar
+        defs={caseAttributeDefs}
+        filters={caseAttrFilters}
+        setFilters={setCaseAttrFilters}
+        hasActiveFilter={hasActiveAttrFilter}
+        clearAll={clearCaseAttrFilters}
       />
 
       {tab === "overview" && (
