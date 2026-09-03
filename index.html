@@ -583,6 +583,31 @@ function PlayToggle({ animate, setAnimate }) {
   );
 }
 
+function DetailSlider({ value, max, isCustom, onChange, onReset }) {
+  if (max <= 1) return null;
+  return (
+    <div className="detail-slider-wrap">
+      <span className="filter-bar-label">Detail level:</span>
+      <input
+        type="range"
+        min={1}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="detail-slider"
+      />
+      <span className="detail-slider-value mono">
+        Top {value} of {max} activities
+      </span>
+      {isCustom && (
+        <button className="play-toggle" onClick={onReset}>
+          Show all
+        </button>
+      )}
+    </div>
+  );
+}
+
 function ProcessMap({
   meta,
   layout,
@@ -1046,6 +1071,7 @@ function ProcessMiningExplorer() {
   const [tab, setTab] = useState("overview");
   const [selectedNode, setSelectedNode] = useState(null);
   const [mapMetric, setMapMetric] = useState("count");
+  const [mapDetailLevel, setMapDetailLevel] = useState(null); // null = "show all" (tracks dataset dynamically)
   const [theme, setTheme] = useState("dark");
   const [animate, setAnimate] = useState(true);
   const [activityFilter, setActivityFilter] = useState(() => new Set());
@@ -1132,6 +1158,39 @@ function ProcessMiningExplorer() {
   }, [cases, activityFilter]);
 
   const analysis = useMemo(() => analyze(filteredCases, activeMeta), [filteredCases, activeMeta]);
+
+  const activityRank = useMemo(() => {
+    return Object.entries(analysis.nodeFreq)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name);
+  }, [analysis.nodeFreq]);
+  const totalActivitiesInMap = activityRank.length;
+  const effectiveDetailLevel = mapDetailLevel === null ? totalActivitiesInMap : Math.min(mapDetailLevel, totalActivitiesInMap);
+  const isDetailCustom = effectiveDetailLevel < totalActivitiesInMap;
+
+  const mapVisibleNodes = useMemo(() => {
+    if (!isDetailCustom) return null;
+    return new Set(activityRank.slice(0, effectiveDetailLevel));
+  }, [activityRank, effectiveDetailLevel, isDetailCustom]);
+
+  const mapVisibleEdges = useMemo(() => {
+    if (!mapVisibleNodes) return null;
+    const s = new Set();
+    Object.keys(analysis.edgeFreq).forEach((k) => {
+      const [a, b] = k.split("→");
+      if (mapVisibleNodes.has(a) && mapVisibleNodes.has(b)) s.add(k);
+    });
+    return s;
+  }, [mapVisibleNodes, analysis.edgeFreq]);
+
+  const handleDetailChange = (v) => {
+    setMapDetailLevel(v);
+    setSelectedNode(null);
+  };
+  const handleDetailReset = () => {
+    setMapDetailLevel(null);
+    setSelectedNode(null);
+  };
 
   const tabs = [
     { id: "overview", label: "Overview" },
@@ -1329,6 +1388,10 @@ function ProcessMiningExplorer() {
         .play-toggle.on { color: var(--amber-soft); border-color: var(--amber); }
         .map-toolbar { margin-bottom: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
+        .detail-slider-wrap { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; }
+        .detail-slider { width: 140px; accent-color: var(--amber); cursor: pointer; }
+        .detail-slider-value { font-size: 11.5px; color: var(--amber-soft); white-space: nowrap; }
+
         .case-viewer { display: grid; grid-template-columns: 250px 1fr; gap: 16px; align-items: start; }
         @media (max-width: 800px) { .case-viewer { grid-template-columns: 1fr; } }
         .case-list-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }
@@ -1453,6 +1516,13 @@ function ProcessMiningExplorer() {
           <div className="map-toolbar">
             <PlayToggle animate={animate} setAnimate={setAnimate} />
             <MetricToggle metric={mapMetric} setMetric={setMapMetric} />
+            <DetailSlider
+              value={effectiveDetailLevel}
+              max={totalActivitiesInMap}
+              isCustom={isDetailCustom}
+              onChange={handleDetailChange}
+              onReset={handleDetailReset}
+            />
           </div>
           <ProcessMap
             meta={activeMeta}
@@ -1465,6 +1535,8 @@ function ProcessMiningExplorer() {
             selected={selectedNode}
             setSelected={setSelectedNode}
             animate={animate}
+            visibleNodes={mapVisibleNodes}
+            visibleEdges={mapVisibleEdges}
           />
         </>
       )}
